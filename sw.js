@@ -1,6 +1,6 @@
 // Service worker: lưu sẵn giao diện để app chạy được khi không có mạng.
 // Đổi VERSION mỗi khi cập nhật mã nguồn để iPhone tải bản mới.
-const VERSION = 'qlbc-v4';
+const VERSION = 'qlbc-v5';
 const FILES = [
   './',
   'index.html',
@@ -14,7 +14,12 @@ const FILES = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));
+  // cache: 'reload' để luôn lấy tệp mới từ máy chủ, không dùng bản cũ còn trong bộ nhớ đệm của trình duyệt.
+  e.waitUntil(
+    caches.open(VERSION)
+      .then((c) => c.addAll(FILES.map((f) => new Request(f, { cache: 'reload' }))))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener('activate', (e) => {

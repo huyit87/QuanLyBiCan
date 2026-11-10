@@ -35,7 +35,7 @@
     { ten: '4 tháng', ngay: 120 },
   ];
   const defaultSettings = () => ({ alertDays: 10, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
-  const APP_VERSION = '4'; // tăng cùng lúc với VERSION trong sw.js
+  const APP_VERSION = '5'; // tăng cùng lúc với VERSION trong sw.js
   const PBKDF2_ITER = 310000;
   const AUTO_LOCK_MS = 60 * 1000;
 
