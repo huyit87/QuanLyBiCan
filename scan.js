@@ -222,6 +222,9 @@ const Scan = (() => {
     // Tên vụ án: phần đứng sau "(khởi tố) vụ án hình sự …" cho tới hết câu, bỏ đoạn viện dẫn điều luật.
     for (const m of f.matchAll(/vu an(?: hinh su)?[ ]*[:：]?[ ]*(?:ve toi[ ]*[:：]?[ ]*)?(["“”']?[^\n;]{6,240})/gd)) {
       const a = m.indices[1][0]; let b = m.indices[1][1]; const seg = f.slice(a, b);
+      // Bỏ qua tiêu đề văn bản viết hoa (QUYẾT ĐỊNH KHỞI TỐ VỤ ÁN HÌNH SỰ) và dòng chức danh người ký đứng sau nó.
+      const lead = src.slice(m.index, a);
+      if (lead === lead.toUpperCase() || /^["“”']?\s*((pho )?thu truong|(pho )?truong phong|toi\b|chung toi|co quan|cong an|vien kiem sat)/.test(seg)) continue;
       if (/^["“”']?\s*(so|ngay|nay|tren|do|va|theo|de|nhu|cho|den|duoc|co|khong|thuoc|noi tren|hinh su)\b|^\d/.test(seg)) continue;
       const cut = /(?<!\b(?:tp|tx|tt|q|p|h|x|kp))\.(?:\s|$)|,?\s*(?:quy dinh tai|theo quy dinh|theo (?:diem|khoan|dieu)|can cu)\b/.exec(seg);
       if (cut) b = a + cut.index;
@@ -230,6 +233,14 @@ const Scan = (() => {
       o.vuAn = name;
       const q = /^\s*["“”']\s*([^"“”']{3,120})["“”']/.exec(raw); if (q) o.toiDanhVuAn = clean(q[1]);
       break;
+    }
+    // Địa bàn xảy ra: "xảy ra (ngày …) tại <địa bàn>".
+    const db = /xay ra[^\n;]{0,60}?\btai\s+([^\n;]{3,140})/d.exec(f);
+    if (db) {
+      const a = db.indices[1][0]; let b = db.indices[1][1];
+      const cut = /(?<!\b(?:tp|tx|tt|q|p|h|x|kp))\.(?:\s|$)|,?\s*(?:quy dinh tai|theo quy dinh|theo (?:diem|khoan|dieu)|can cu|vao ngay|ngay \d)/.exec(f.slice(a, b));
+      if (cut) b = a + cut.index;
+      o.diaBan = clean(src.slice(a, b));
     }
     o.dtv = titleCase(field(f, src, 'dieu tra vien(?: thu ly)?', true));
     o.ksv = titleCase(field(f, src, 'kiem sat vien(?: thu ly)?', true));
@@ -267,6 +278,12 @@ const Scan = (() => {
     const type = common.docType || ''; delete common.docType;
     if (!common.toiDanh && common.toiDanhVuAn) common.toiDanh = common.toiDanhVuAn;
     delete common.toiDanhVuAn;
+    // Quyết định khởi tố vụ án không ghi rõ tên vụ thì ghép tên từ tội danh và địa bàn.
+    if (type === 'ktva' && !common.vuAn && common.toiDanh) common.vuAn = common.toiDanh;
+    if (type === 'ktva' && common.vuAn) {
+      if (!common.toiDanh) common.toiDanh = clean(common.vuAn.split(/\s+xảy ra\b/i)[0]);
+      if (common.diaBan && !/xảy ra/i.test(common.vuAn)) common.vuAn += ' xảy ra tại ' + common.diaBan;
+    }
     const marks = [...f.matchAll(new RegExp(NAME_RE, 'gd'))].filter((m) => m.indices[1][1] > m.indices[1][0]);
     const persons = [];
     if (marks.length) {

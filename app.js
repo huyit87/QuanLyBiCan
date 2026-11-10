@@ -38,7 +38,7 @@
   ];
   // statDay/statMonth: ngày bắt đầu kỳ thống kê năm (mặc định 15/11: năm 2026 là 15/11/2025 – 14/11/2026).
   const defaultSettings = () => ({ alertDays: 10, statDay: 15, statMonth: 11, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
-  const APP_VERSION = '7'; // tăng cùng lúc với VERSION trong sw.js
+  const APP_VERSION = '8'; // tăng cùng lúc với VERSION trong sw.js
   const PBKDF2_ITER = 310000;
   const AUTO_LOCK_MS = 60 * 1000;
 
@@ -153,7 +153,7 @@
     for (const k of ['loaiHan', 'soKLDT', 'ngayKLDT', 'soDC', 'ngayDC', 'soTDC', 'ngayTDC']) r[k] = r[k] || '';
     return r;
   }
-  function normCase(c) { for (const k of ['soKLDT', 'ngayKLDT', 'soDC', 'ngayDC', 'soTDC', 'ngayTDC', 'ghiChu']) c[k] = c[k] || ''; return c; }
+  function normCase(c) { for (const k of ['diaBan', 'dauVu', 'soKLDT', 'ngayKLDT', 'soDC', 'ngayDC', 'soTDC', 'ngayTDC', 'ghiChu']) c[k] = c[k] || ''; return c; }
   // Ghi ngày đình chỉ / tạm đình chỉ mới thì chuyển giai đoạn tương ứng.
   function stageFromStop(r, old) {
     if (r.ngayDC && (!old || old.ngayDC !== r.ngayDC)) r.giaiDoan = 'dinhchi';
@@ -199,7 +199,7 @@
   }
   const caseByName = (name) => { const k = normName(name); return k ? cases.find((c) => normName(c.ten) === k) : undefined; };
   function blankCase(ten = '') {
-    return { id: uid(), ten, soQDKTVA: '', ngayKTVA: '', toiDanh: '', dieuKhoan: '', dtv: '', soKLDT: '', ngayKLDT: '', soDC: '', ngayDC: '', soTDC: '', ngayTDC: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
+    return { id: uid(), ten, soQDKTVA: '', ngayKTVA: '', toiDanh: '', dieuKhoan: '', diaBan: '', dauVu: '', dtv: '', soKLDT: '', ngayKLDT: '', soDC: '', ngayDC: '', soTDC: '', ngayTDC: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
   }
   const CASE_SEED = ['soQDKTVA', 'ngayKTVA', 'toiDanh', 'dieuKhoan', 'dtv'];
   // Bảo đảm tên vụ án ghi trong hồ sơ bị can luôn có trong danh sách vụ án.
@@ -222,6 +222,9 @@
   }
   const casePeople = (c) => records.filter((r) => normName(r.vuAn) === normName(c.ten));
   const first = (list, k) => list.map((r) => r[k]).filter(Boolean).sort()[0] || '';
+  const byKTBC = (a, b) => (a.ngayKTBC || '9999').localeCompare(b.ngayKTBC || '9999') || byName(a, b);
+  // Bị can đầu vụ: người được chọn trong vụ án, nếu chưa chọn thì là bị can bị khởi tố sớm nhất.
+  const leadOf = (c, rs) => rs.find((r) => r.id === c.dauVu) || [...rs].sort(byKTBC)[0];
   const caseDate = (c, rs) => c.ngayKTVA || first(rs || casePeople(c), 'ngayKTVA');
   function caseStatus(c, rs) {
     const any = (...g) => rs.some((r) => g.includes(r.giaiDoan));
@@ -408,9 +411,15 @@
       <h3 class="section-title">${list.length} vụ án đang quản lý — theo ngày khởi tố</h3>
       ${list.length || loose.length ? `<div class="card">${list.map(({ c, rs, kt }, i) => {
         const st = caseStatus(c, rs);
-        return `<button class="row" data-act="case" data-name="${esc(c.ten)}"><div class="main"><div class="name" style="white-space:normal">${i + 1}. ${esc(c.ten)}</div>
-          <div class="sub" style="white-space:normal">${esc([kt ? 'Khởi tố ' + vn(kt) : 'Chưa ghi ngày khởi tố', c.soQDKTVA ? 'QĐ số ' + c.soQDKTVA : '', `${rs.length} bị can`].filter(Boolean).join(' · '))}</div></div>
-          <div class="right"><span class="tag ${st === 'dtbs' ? 'orange' : st === 'dieutra' ? 'blue' : st === 'ketluan' ? 'green' : ''}">${esc(GIAI_DOAN[st])}</span></div></button>`;
+        const lead = leadOf(c, rs); const toi = c.toiDanh || first(rs, 'toiDanh');
+        const head = lead ? `${lead.hoTen}${rs.length > 1 ? ' cùng đồng phạm' : ''}` : c.ten;
+        return `<button class="row crow" data-act="case" data-name="${esc(c.ten)}"><div class="main">
+          <div class="name" style="white-space:normal">${i + 1}. ${esc(head)}</div>
+          ${toi ? `<div class="cl"><span>Tội danh</span>${esc(toi)}</div>` : ''}
+          ${c.diaBan ? `<div class="cl"><span>Địa bàn</span>${esc(c.diaBan)}</div>` : ''}
+          <div class="sub" style="white-space:normal">${esc([kt ? 'Khởi tố ' + vn(kt) : 'Chưa ghi ngày khởi tố', c.soQDKTVA ? 'QĐ số ' + c.soQDKTVA : '', `${rs.length} bị can`].filter(Boolean).join(' · '))}
+            <span class="tag ${st === 'dtbs' ? 'orange' : st === 'dieutra' ? 'blue' : st === 'ketluan' ? 'green' : ''}">${esc(GIAI_DOAN[st])}</span></div>
+        </div><span class="chev">›</span></button>`;
       }).join('')}${loose.length ? `<button class="row" data-act="case" data-name=""><div class="main"><div class="name">Bị can chưa gắn vụ án</div><div class="sub">${loose.length} bị can</div></div><span class="chev">›</span></button>` : ''}</div>`
       : '<div class="empty">Chưa có vụ án nào.</div>'}
       <button class="btn" data-act="newScan">Thêm vụ án từ văn bản (QĐ khởi tố vụ án)</button>
@@ -419,11 +428,11 @@
     </main>`;
   }
   // Thẻ thông tin bị can trong trang vụ án.
-  function personCard(r, i) {
+  function personCard(r, i, lead) {
     const d = dlInfo(r); const bs = r.dtbs[r.dtbs.length - 1];
     const line = (k, v) => (v ? `<div class="pl"><span>${esc(k)}</span><div>${esc(v)}</div></div>` : '');
     return `<button class="pcard" data-act="open" data-id="${esc(r.id)}">
-      <div class="pc-head">${avatar(r)}<div class="main"><div class="name">${i + 1}. ${esc(r.hoTen)}</div>
+      <div class="pc-head">${avatar(r)}<div class="main"><div class="name">${i + 1}. ${esc(r.hoTen)} ${lead ? '<span class="tag blue">Đầu vụ</span>' : ''}</div>
         <div class="sub">${esc([r.ngaySinh ? 'Sinh ' + vn(r.ngaySinh) : '', r.cccd ? 'CCCD ' + r.cccd : ''].filter(Boolean).join(' · '))}</div></div><span class="chev">›</span></div>
       <div class="pc-tags">${bpTag(r)}<span class="tag">${esc(GIAI_DOAN[r.giaiDoan] || '')}</span>${d ? `<span class="tag ${d.level}">${esc(d.text)}</span>` : ''}</div>
       ${line('Khởi tố bị can', so(r.soQDKTBC, r.ngayKTBC))}
@@ -438,8 +447,10 @@
   }
   function viewCase(name) {
     const c = caseByName(name);
-    const rs = (c ? casePeople(c) : records.filter((r) => !normName(r.vuAn))).sort((a, b) => (a.ngayKTBC || '9999').localeCompare(b.ngayKTBC || '9999') || byName(a, b));
-    const people = rs.map((r, i) => personCard(r, i)).join('');
+    const rs = (c ? casePeople(c) : records.filter((r) => !normName(r.vuAn))).sort(byKTBC);
+    const lead = c && leadOf(c, rs);
+    if (lead) { rs.splice(rs.indexOf(lead), 1); rs.unshift(lead); }   // bị can đầu vụ đứng đầu
+    const people = rs.map((r, i) => personCard(r, i, r === lead)).join('');
     if (!c) {
       return `${bar('Chưa gắn vụ án', '<button data-act="back">‹ Quay lại</button>')}
       <main class="content nopad-bottom"><p class="note" style="margin-bottom:8px">Mở từng hồ sơ, bấm Sửa và chọn tên vụ án để gắn bị can vào vụ.</p>
@@ -448,7 +459,8 @@
     return `${bar('Vụ án', '<button data-act="back">‹ Quay lại</button>', `<button class="strong" data-act="editCase" data-id="${esc(c.id)}">Sửa</button>`)}
     <main class="content nopad-bottom">
       <div class="card pad"><h2 style="font-size:18px">${esc(c.ten)}</h2><div style="margin-top:6px"><span class="tag">${esc(GIAI_DOAN[caseStatus(c, rs)])}</span></div></div>
-      ${block('Thông tin vụ án', [kv('QĐ khởi tố vụ án', so(c.soQDKTVA, caseDate(c, rs))), kv('Tội danh', c.toiDanh), kv('Điều khoản BLHS', c.dieuKhoan),
+      ${block('Thông tin vụ án', [kv('Bị can đầu vụ', lead ? lead.hoTen : ''), kv('Tội danh', c.toiDanh || first(rs, 'toiDanh')), kv('Điều khoản BLHS', c.dieuKhoan),
+        kv('Địa bàn xảy ra', c.diaBan), kv('QĐ khởi tố vụ án', so(c.soQDKTVA, caseDate(c, rs))),
         kv('Điều tra viên', c.dtv), kv('Kết luận điều tra', so(c.soKLDT, c.ngayKLDT)), kv('Tạm đình chỉ', so(c.soTDC, c.ngayTDC)), kv('Đình chỉ', so(c.soDC, c.ngayDC)), kv('Ghi chú', c.ghiChu)])}
       <h3 class="section-title">Bị can bị khởi tố (${rs.length})</h3>
       ${people || '<div class="card"><div class="empty">Chưa có bị can nào trong vụ này.</div></div>'}
@@ -465,6 +477,7 @@
   }
   function viewCaseForm() {
     const c = ui.cdraft; const isNew = !cases.some((x) => x.id === c.id);
+    const old = cases.find((x) => x.id === c.id); const people = old ? casePeople(old).sort(byKTBC) : [];
     return `${bar(isNew ? 'Thêm vụ án' : 'Sửa vụ án', '<button data-act="cancel">Huỷ</button>', '<button class="strong" data-act="saveCase">Lưu</button>')}
     <main class="content nopad-bottom"><form id="cform" autocomplete="off">
       <div class="card">
@@ -479,8 +492,11 @@
         ${inp('Ngày khởi tố vụ án', 'ngayKTVA', c.ngayKTVA, 'date')}
         ${inp('Tội danh', 'toiDanh', c.toiDanh)}
         ${inp('Điều, khoản BLHS', 'dieuKhoan', c.dieuKhoan)}
+        ${area('Địa bàn xảy ra', 'diaBan', c.diaBan)}
+        ${people.length ? sel('Bị can đầu vụ', 'dauVu', people.some((r) => r.id === c.dauVu) ? c.dauVu : '', Object.assign({ '': 'Tự động: bị can bị khởi tố sớm nhất' }, Object.fromEntries(people.map((r) => [r.id, r.hoTen])))) : ''}
         ${inp('Điều tra viên thụ lý', 'dtv', c.dtv, 'text', 'autocapitalize="words"')}
       </div>
+      ${people.length ? '' : '<p class="note">Chọn bị can đầu vụ sau khi đã thêm bị can vào vụ án.</p>'}
       <h3 class="section-title">Kết luận điều tra vụ án</h3>
       <div class="card">
         ${inp('Bản kết luận điều tra số', 'soKLDT', c.soKLDT)}
@@ -852,7 +868,7 @@
     return filled;
   }
   const CASE_FIELDS = { ten: ['vuAn', 'Tên vụ án'], soQDKTVA: ['soQDKTVA', 'Số QĐ khởi tố vụ án'], ngayKTVA: ['ngayKTVA', 'Ngày khởi tố vụ án'], toiDanh: ['toiDanh', 'Tội danh'],
-    dieuKhoan: ['dieuKhoan', 'Điều khoản'], dtv: ['dtv', 'Điều tra viên'], soKLDT: ['soKLDT', 'Số kết luận điều tra'], ngayKLDT: ['ngayKLDT', 'Ngày kết luận điều tra'],
+    dieuKhoan: ['dieuKhoan', 'Điều khoản'], diaBan: ['diaBan', 'Địa bàn xảy ra'], dtv: ['dtv', 'Điều tra viên'], soKLDT: ['soKLDT', 'Số kết luận điều tra'], ngayKLDT: ['ngayKLDT', 'Ngày kết luận điều tra'],
     soTDC: ['soTDC', 'Số QĐ tạm đình chỉ'], ngayTDC: ['ngayTDC', 'Ngày tạm đình chỉ'], soDC: ['soDC', 'Số QĐ đình chỉ'], ngayDC: ['ngayDC', 'Ngày đình chỉ'] };
   function applyCaseScan(c, got) {
     const filled = [];

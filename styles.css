@@ -265,3 +265,11 @@ h1, h2, h3, p { margin: 0; }
 .pcard .pl { display: flex; gap: 10px; padding: 5px 0; border-top: 1px solid var(--line); font-size: 15px; }
 .pcard .pl span { width: 36%; flex-shrink: 0; padding-top: 1px; }
 .pcard .pl div { flex: 1; min-width: 0; word-break: break-word; }
+
+/* ---------- Dòng vụ án ---------- */
+.crow { align-items: flex-start; }
+.crow .cl { font-size: 14px; margin-top: 2px; white-space: normal; }
+.crow .cl span { color: var(--muted); margin-right: 6px; }
+.crow .sub { margin-top: 4px; }
+.crow .sub .tag { margin-left: 4px; }
+.crow .chev { align-self: center; }
