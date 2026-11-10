@@ -226,3 +226,17 @@ h1, h2, h3, p { margin: 0; }
   background: rgba(30,30,32,.94); color: #fff; padding: 10px 16px; border-radius: 20px; font-size: 14px;
   z-index: 100; max-width: 86%; text-align: center;
 }
+
+/* ---------- Quét văn bản ---------- */
+#busy { position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 24px; }
+#busy > div { background: var(--card); border-radius: 14px; padding: 22px 20px; text-align: center; max-width: 300px; width: 100%; }
+#busy p { margin-top: 12px; font-size: 15px; }
+.spin { width: 34px; height: 34px; margin: 0 auto; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--accent); animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.scan-note { background: var(--orange-bg); color: var(--text); font-size: 14px; }
+.scan-note p { margin-top: 4px; }
+.scan-note details { margin-top: 8px; }
+.scan-note summary { color: var(--accent); }
+.scan-note pre { white-space: pre-wrap; word-break: break-word; font: 12px/1.4 ui-monospace, Menlo, monospace; max-height: 240px; overflow: auto; margin: 8px 0 0; }
+.check { width: 24px; height: 24px; border-radius: 12px; border: 2px solid var(--line); flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 14px; color: #fff; }
+.check.on { background: #0a66c2; border-color: #0a66c2; }

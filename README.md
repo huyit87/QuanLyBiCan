@@ -28,6 +28,7 @@ Khác với bản web:
 - Hồ sơ bị can: lý lịch, ảnh, vụ án, tội danh, quyết định khởi tố, biện pháp ngăn chặn, điều tra viên / kiểm sát viên thụ lý, ghi chú.
 - Theo dõi thời hạn tạm giữ, tạm giam và các lần gia hạn; cảnh báo hạn sắp hết / quá hạn ở màn hình Tổng quan.
 - Tìm kiếm không dấu, lọc theo biện pháp ngăn chặn và giai đoạn tố tụng, nhóm bị can theo vụ án.
+- Quét văn bản (ảnh chụp hoặc PDF quyết định khởi tố, lệnh tạm giam, kết luận điều tra…) để tự điền hồ sơ; văn bản có nhiều bị can thì tạo nhiều hồ sơ. Việc đọc chữ chạy ngay trên máy, không gửi văn bản đi đâu. Kết quả chỉ là gợi ý, cần kiểm tra lại trước khi lưu. Lần đầu dùng cần có mạng để tải bộ đọc chữ (khoảng 6 MB), sau đó dùng được khi không có mạng.
 - Xuất bản sao lưu đã mã hoá (`.qlbc`), khôi phục, xuất danh sách ra Excel (CSV).
 - Chạy được khi không có mạng.
 
@@ -61,3 +62,7 @@ Mở <http://localhost:8000>.
 ## Cập nhật
 
 Sau khi sửa mã nguồn, tăng `VERSION` trong `sw.js` để iPhone tải bản mới.
+
+## Thư viện bên thứ ba
+
+Thư mục `vendor/` chứa Tesseract.js 5.1.1 và dữ liệu tiếng Việt (đọc chữ trong ảnh), pdf.js 4.10 (đọc PDF), đều theo giấy phép Apache-2.0; tệp giấy phép nằm cùng thư mục.

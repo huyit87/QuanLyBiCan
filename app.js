@@ -126,7 +126,7 @@
   let auth = null;           // { salt, iter, check }
   let records = [];          // hồ sơ đã giải mã
   let settings = defaultSettings();
-  const ui = { tab: 'home', page: null, q: '', filter: 'all', draft: null, lockErr: '' };
+  const ui = { tab: 'home', page: null, q: '', filter: 'all', draft: null, lockErr: '', scan: null };
 
   async function loadRecords() {
     const rows = await tx('bican', 'readonly', (s) => s.getAll());
@@ -223,7 +223,9 @@
       <h3 class="section-title">Hạn tạm giữ, tạm giam cần chú ý (${al.length})</h3>
       <div class="card">${al.length ? al.map((x) => personRow(x.r, true)).join('') : `<div class="empty">Không có hạn nào quá hạn hoặc sắp hết trong ${settings.alertDays} ngày tới.</div>`}</div>
       ${upcoming.length ? `<h3 class="section-title">Các hạn tiếp theo</h3><div class="card">${upcoming.map((x) => personRow(x.r, true)).join('')}</div>` : ''}
-      ${records.length ? '' : '<button class="btn" data-act="new">Thêm bị can đầu tiên</button>'}
+      <button class="btn" data-act="newScan">Thêm bị can từ văn bản (ảnh, PDF)</button>
+      <button class="btn plain" data-act="new">Thêm bị can nhập tay</button>
+      <input id="scanFile" type="file" accept="image/*,application/pdf,.pdf" multiple hidden>
     </main>`;
   }
 
@@ -383,6 +385,13 @@
         </div></div>
         <input id="photoFile" type="file" accept="image/*" hidden>
       </div>
+      <div class="card" style="margin-top:10px">
+        <button type="button" class="row" data-act="pickScan"><div class="main"><div class="name link">Quét văn bản để tự điền (ảnh, PDF)</div><div class="sub">Quyết định khởi tố, lệnh tạm giam… Đọc chữ ngay trên máy</div></div></button>
+        <input id="scanFile" type="file" accept="image/*,application/pdf,.pdf" multiple hidden>
+      </div>
+      ${ui.scan ? `<div class="card pad scan-note" style="margin-top:10px"><b>Đã tự điền ${ui.scan.filled.length} mục từ văn bản — hãy kiểm tra lại từng mục trước khi lưu.</b>
+        ${ui.scan.filled.length ? `<p>${esc(ui.scan.filled.join(', '))}</p>` : '<p>Không dò được thông tin nào. Thử ảnh rõ hơn, chụp thẳng, đủ sáng.</p>'}
+        <details><summary>Xem chữ đọc được</summary><pre>${esc(ui.scan.text)}</pre></details></div>` : ''}
       <h3 class="section-title">Lý lịch</h3>
       <div class="card">
         ${inp('Họ và tên *', 'hoTen', r.hoTen, 'text', 'autocapitalize="words" required')}
@@ -462,6 +471,58 @@
     </form></main>`;
   }
 
+  // ---------- Quét văn bản ----------
+  const FIELD_NAMES = { hoTen: 'Họ tên', tenKhac: 'Tên gọi khác', gioiTinh: 'Giới tính', ngaySinh: 'Ngày sinh', cccd: 'CCCD', quocTich: 'Quốc tịch', danToc: 'Dân tộc',
+    ngheNghiep: 'Nghề nghiệp', hktt: 'Nơi thường trú', choO: 'Chỗ ở', tienAn: 'Tiền án, tiền sự', vuAn: 'Vụ án', soQDKTVA: 'Số QĐ khởi tố vụ án', ngayKTVA: 'Ngày khởi tố vụ án',
+    toiDanh: 'Tội danh', dieuKhoan: 'Điều khoản', soQDKTBC: 'Số QĐ khởi tố bị can', ngayKTBC: 'Ngày khởi tố bị can', bienPhap: 'Biện pháp ngăn chặn', ngayBat: 'Ngày bắt',
+    noiGiam: 'Nơi giam giữ', soLenh: 'Số lệnh', tgTu: 'Từ ngày', tgDen: 'Đến ngày', giaHan: 'Gia hạn', dtv: 'Điều tra viên', ksv: 'Kiểm sát viên' };
+  const ALWAYS_SET = ['bienPhap', 'gioiTinh', 'quocTich', 'danToc'];
+  // Điền kết quả quét vào hồ sơ: không ghi đè ô người dùng đã nhập. Trả về tên các mục đã điền.
+  function applyScan(r, got) {
+    const filled = [];
+    for (const [k, v] of Object.entries(got)) {
+      if (!(k in FIELD_NAMES)) continue;
+      if (k === 'giaHan') { r.giaHan.push(...v.map((g) => ({ so: g.so || '', loai: '', tu: g.tu || '', den: g.den || '' }))); filled.push(FIELD_NAMES[k]); continue; }
+      if (r[k] === v) continue;
+      if (!r[k] || ALWAYS_SET.includes(k)) { r[k] = v; filled.push(FIELD_NAMES[k]); }
+    }
+    return filled;
+  }
+  function busy_(msg) {
+    let el = $('#busy');
+    if (msg == null) { if (el) el.remove(); return; }
+    if (!el) { el = document.createElement('div'); el.id = 'busy'; el.innerHTML = '<div><div class="spin"></div><p></p></div>'; document.body.appendChild(el); }
+    $('p', el).textContent = msg;
+  }
+  async function runScan(files) {
+    busy_('Đang chuẩn bị…');
+    let res;
+    try { res = Scan.parse(await Scan.read(files, busy_)); } finally { busy_(null); Scan.dispose(); }
+    if (!key) return; // app đã tự khoá trong lúc quét
+    if (res.persons.length > 1 && !(ui.page && ui.page.type === 'form' && records.some((x) => x.id === ui.draft.id))) {
+      ui.draft = null;
+      ui.page = { type: 'scanReview', persons: res.persons.map((p) => ({ on: true, got: p })), text: res.text, from: null };
+      render(); return;
+    }
+    if (!(ui.page && ui.page.type === 'form')) { ui.draft = blank(); ui.page = { type: 'form', from: ui.page }; } else syncDraft();
+    ui.scan = { filled: applyScan(ui.draft, res.persons[0] || {}), text: res.text };
+    render();
+    toast(ui.scan.filled.length ? `Đã tự điền ${ui.scan.filled.length} mục — hãy kiểm tra lại` : 'Không dò được thông tin từ văn bản');
+  }
+  function viewScanReview() {
+    const pg = ui.page; const n = pg.persons.filter((p) => p.on).length;
+    return `${bar('Kết quả quét', '<button data-act="back">Huỷ</button>')}
+    <main class="content nopad-bottom">
+      <div class="card pad scan-note"><b>Tìm thấy ${pg.persons.length} bị can trong văn bản.</b><p>Bỏ chọn người không cần lưu. Sau khi lưu, mở từng hồ sơ để kiểm tra và sửa lại.</p>
+        <details><summary>Xem chữ đọc được</summary><pre>${esc(pg.text)}</pre></details></div>
+      <div class="card" style="margin-top:10px">${pg.persons.map((p, i) => `<button class="row" data-act="scanToggle" data-i="${i}">
+        <span class="check ${p.on ? 'on' : ''}">${p.on ? '✓' : ''}</span>
+        <div class="main"><div class="name">${esc(p.got.hoTen || '(chưa đọc được họ tên)')}</div>
+        <div class="sub" style="white-space:normal">${esc([p.got.ngaySinh ? 'Sinh ' + vn(p.got.ngaySinh) : '', p.got.cccd ? 'CCCD ' + p.got.cccd : '', p.got.toiDanh, p.got.hktt].filter(Boolean).join(' · '))}</div></div></button>`).join('')}</div>
+      <button class="btn" data-act="scanSave" ${n ? '' : 'disabled'}>Lưu ${n} hồ sơ</button>
+    </main>`;
+  }
+
   // ---------- Giao diện: khoá ----------
   function viewLock() {
     const head = '<img src="icons/icon-192.png" alt=""><h1>Quản lý bị can</h1>';
@@ -497,10 +558,11 @@
     else if (ui.page.type === 'form') app.innerHTML = viewForm();
     else if (ui.page.type === 'case') app.innerHTML = viewCase(ui.page.name);
     else if (ui.page.type === 'pass') app.innerHTML = viewPass();
+    else if (ui.page.type === 'scanReview') app.innerHTML = viewScanReview();
     window.scrollTo(0, keepScroll ? y : 0);
   }
   function lock() {
-    key = null; records = []; ui.page = null; ui.draft = null; ui.lockErr = '';
+    key = null; records = []; ui.page = null; ui.draft = null; ui.scan = null; ui.lockErr = '';
     render();
   }
 
@@ -583,13 +645,21 @@
     open(el) { ui.page = { type: 'detail', id: el.dataset.id, from: ui.page }; render(); },
     case(el) { ui.page = { type: 'case', name: el.dataset.name }; render(); },
     back() { ui.page = (ui.page && ui.page.from) || null; render(); },
-    new() { ui.draft = blank(); if (ui.page && ui.page.type === 'case' && ui.page.name !== 'Chưa gắn vụ án') ui.draft.vuAn = ui.page.name; ui.page = { type: 'form', from: ui.page }; render(); },
+    new() { ui.scan = null; ui.draft = blank(); if (ui.page && ui.page.type === 'case' && ui.page.name !== 'Chưa gắn vụ án') ui.draft.vuAn = ui.page.name; ui.page = { type: 'form', from: ui.page }; render(); },
     edit(el) {
       const r = records.find((x) => x.id === el.dataset.id); if (!r) return;
-      ui.draft = JSON.parse(JSON.stringify(r)); ui.draft.giaHan = ui.draft.giaHan || []; ui.draft.loaiHan = ui.draft.loaiHan || '';
+      ui.scan = null; ui.draft = JSON.parse(JSON.stringify(r)); ui.draft.giaHan = ui.draft.giaHan || []; ui.draft.loaiHan = ui.draft.loaiHan || '';
       ui.page = { type: 'form', from: ui.page }; render();
     },
-    cancel() { ui.draft = null; ui.page = ui.page.from || null; render(); },
+    cancel() { ui.draft = null; ui.scan = null; ui.page = ui.page.from || null; render(); },
+    pickScan() { $('#scanFile').click(); },
+    newScan() { $('#scanFile').click(); },
+    scanToggle(el) { const p = ui.page.persons[Number(el.dataset.i)]; p.on = !p.on; render(true); },
+    async scanSave() {
+      const list = ui.page.persons.filter((p) => p.on);
+      for (const p of list) { const r = blank(); applyScan(r, p.got); if (!r.hoTen) r.hoTen = '(chưa đọc được họ tên)'; await putRecord(r); }
+      ui.page = null; ui.tab = 'list'; ui.filter = 'all'; ui.q = ''; toast(`Đã lưu ${list.length} hồ sơ — hãy mở từng hồ sơ để kiểm tra`); render();
+    },
     async save() {
       syncDraft(); const r = ui.draft;
       if (!r.hoTen) { toast('Vui lòng nhập họ và tên'); return; }
@@ -597,7 +667,7 @@
       r.giaHan = r.giaHan.filter((g) => g.so || g.tu || g.den);
       r.updatedAt = Date.now();
       await putRecord(r);
-      ui.draft = null;
+      ui.draft = null; ui.scan = null;
       const from = ui.page.from;
       ui.page = from && from.type === 'detail' ? from : { type: 'detail', id: r.id, from };
       toast('Đã lưu'); render();
@@ -671,6 +741,8 @@
         }
       } else if (t.id === 'photoFile' && t.files[0]) {
         syncDraft(); ui.draft.anh = await readPhoto(t.files[0]); render(true);
+      } else if (t.id === 'scanFile' && t.files.length) {
+        const files = [...t.files]; t.value = ''; await runScan(files);
       } else if (t.id === 'restoreFile' && t.files[0]) {
         const f = t.files[0]; t.value = ''; await importBackup(f);
       }
