@@ -94,6 +94,22 @@ const Scan = (() => {
     return out.join('\n');
   }
 
+  // Đọc và tách thành từng văn bản: mỗi PDF là một văn bản; ảnh có phần đầu văn bản ("Số: …", tên loại văn bản)
+  // mở đầu một văn bản mới, ảnh không có thì là trang tiếp theo của văn bản trước.
+  async function readDocs(files, onProgress = () => {}) {
+    const docs = [];
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i]; const label = files.length > 1 ? `Tệp ${i + 1}/${files.length}` : 'Ảnh';
+      if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) { docs.push({ name: f.name, text: await readPdf(f, (m) => onProgress(files.length > 1 ? `${label} — ${m}` : m)) }); continue; }
+      const text = await ocr(toCanvas(await fileToImage(f)), label, onProgress);
+      const head = fold(text.slice(0, 600));
+      const starts = /\bso\s*[:：]/.test(head) || TYPES.some(([, re]) => re.test(head)) || /cong hoa xa hoi chu nghia/.test(head);
+      const last = docs[docs.length - 1];
+      if (!starts && last && last.image) { last.text += '\n' + text; last.name += ', ' + f.name; } else docs.push({ name: f.name, text, image: true });
+    }
+    return docs;
+  }
+
   // ---------- Dò thông tin trong văn bản ----------
   // Bỏ dấu từng ký tự một (giữ nguyên độ dài) để vị trí khớp trùng với văn bản gốc.
   function fold(s) {
@@ -180,14 +196,15 @@ const Scan = (() => {
     const o = {};
     let type = ''; let pos = Infinity;
     for (const [k, re] of TYPES) { const m = re.exec(f); if (m && m.index < pos) { pos = m.index; type = k; } }
-    const so = /\bso\s*[:：]\s*(\S*\d\S*)/d.exec(f);
-    const docSo = so ? clean(src.slice(so.indices[1][0], so.indices[1][1])) : '';
+    // Số văn bản, kể cả khi bị đọc thành "27 /QĐ-CSMT" (có khoảng trắng quanh dấu gạch chéo).
+    const so = /\bso\s*[:：]\s*(\d+\s?\/\s?[^\s,;]+|\S*\d\S*)/d.exec(f);
+    const docSo = so ? clean(src.slice(so.indices[1][0], so.indices[1][1])).replace(/\s*\/\s*/g, '/') : '';
     const dn = /ngay\s*(\d{1,2})\s*thang\s*(\d{1,2})\s*nam\s*(\d{4})/.exec(f);
     const docNgay = dn ? mkDate(dn[1], dn[2], dn[3]) : '';
 
     const ref = (name) => {
-      const m = new RegExp(`${name}\\s*so\\s*[:：]?\\s*(\\S*\\d\\S*)[\\s\\S]{0,60}?ngay\\s*${DATE}`, 'd').exec(f);
-      return m ? [clean(src.slice(m.indices[1][0], m.indices[1][1])), mkDate(m[2], m[3], m[4])] : null;
+      const m = new RegExp(`${name}\\s*so\\s*[:：]?\\s*(\\d+\\s?\\/\\s?[^\\s,;]+|\\S*\\d\\S*)[\\s\\S]{0,60}?ngay\\s*${DATE}`, 'd').exec(f);
+      return m ? [clean(src.slice(m.indices[1][0], m.indices[1][1])).replace(/\s*\/\s*/g, '/'), mkDate(m[2], m[3], m[4])] : null;
     };
     const va = ref('quyet dinh khoi to vu an(?: hinh su)?'); if (va) { o.soQDKTVA = va[0]; o.ngayKTVA = va[1]; }
     const bc = ref('quyet dinh khoi to bi can'); if (bc) { o.soQDKTBC = bc[0]; o.ngayKTBC = bc[1]; }
@@ -312,5 +329,5 @@ const Scan = (() => {
 
   async function dispose() { if (worker) { const w = worker; worker = null; try { await w.terminate(); } catch (e) { /* bỏ qua */ } } }
 
-  return { read, parse, dispose };
+  return { read, readDocs, parse, dispose };
 })();

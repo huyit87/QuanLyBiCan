@@ -28,6 +28,8 @@ Khác với bản web:
 - Hồ sơ bị can: lý lịch, ảnh, vụ án, tội danh, quyết định khởi tố, biện pháp ngăn chặn, điều tra viên / kiểm sát viên thụ lý, ghi chú.
 - Theo dõi thời hạn tạm giữ, tạm giam và các lần gia hạn; cảnh báo hạn sắp hết / quá hạn ở màn hình Tổng quan.
 - Vụ án: danh sách vụ án riêng (tên vụ, quyết định khởi tố, tội danh, kết luận điều tra); quét quyết định khởi tố vụ án để tự điền tên vụ; bị can tự gắn vào vụ theo tên hoặc số quyết định khởi tố vụ án.
+- Tên vụ án được app tự đặt theo quy ước: đối tượng chính + hành vi + phường xảy ra (ví dụ "Nguyễn Văn An mua bán trái phép chất ma túy tại phường Bến Thành"); có thể chuyển sang tự nhập tên cho từng vụ.
+- Đưa nhiều văn bản một lượt: app đọc từng văn bản, tự nhận quyết định khởi tố vụ án và văn bản của bị can, lưu và gắn bị can vào vụ theo số quyết định khởi tố vụ án.
 - Kết luận điều tra và điều tra bổ sung (lần thứ mấy, Viện kiểm sát hay Toà án trả hồ sơ) cho từng bị can.
 - Phát hiện bị can nhập trùng (trùng CCCD, hoặc trùng họ tên và ngày sinh), gộp hồ sơ trùng; quét văn bản của người đã có hồ sơ thì bổ sung vào hồ sơ cũ.
 - Ghi quyết định tạm đình chỉ, đình chỉ (số, ngày) cho bị can và vụ án.
