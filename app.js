@@ -38,7 +38,7 @@
   ];
   // statDay/statMonth: ngày bắt đầu kỳ thống kê năm (mặc định 15/11: năm 2026 là 15/11/2025 – 14/11/2026).
   const defaultSettings = () => ({ alertDays: 10, statDay: 15, statMonth: 11, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
-  const APP_VERSION = '9'; // tăng cùng lúc với VERSION trong sw.js
+  const APP_VERSION = '10'; // tăng cùng lúc với VERSION trong sw.js
   const PBKDF2_ITER = 310000;
   const AUTO_LOCK_MS = 60 * 1000;
 
@@ -512,11 +512,18 @@
       ${rs.length ? '' : `<button class="btn danger" data-act="delCase" data-id="${esc(c.id)}">Xoá vụ án</button>`}
     </main>`;
   }
+  // Các mục quan trọng còn trống sau khi đọc văn bản — để người dùng biết cần nhập tay hoặc quét thêm văn bản nào.
+  const NEED = {
+    case: [['soQDKTVA', 'số QĐ khởi tố vụ án'], ['ngayKTVA', 'ngày khởi tố vụ án'], ['toiDanh', 'tội danh'], ['diaBan', 'địa bàn xảy ra']],
+    person: [['ngaySinh', 'ngày sinh'], ['cccd', 'CCCD'], ['hktt', 'nơi thường trú'], ['toiDanh', 'tội danh'], ['soQDKTBC', 'số QĐ khởi tố bị can'], ['ngayKTBC', 'ngày khởi tố bị can'], ['vuAn', 'vụ án']],
+  };
+  const missing = (kind, o) => (o ? NEED[kind].filter(([k]) => !o[k]).map(([, t]) => t) : []);
   function scanNote(what) {
     if (!ui.scan) return '';
     return `<div class="card pad scan-note" style="margin-top:10px"><b>Đã tự điền ${ui.scan.filled.length} mục từ văn bản — hãy kiểm tra lại từng mục trước khi lưu.</b>
       ${ui.scan.existed ? `<p>${esc(what)} này đã có trong app — thông tin mới được bổ sung vào hồ sơ cũ, không tạo hồ sơ trùng.</p>` : ''}
-      ${ui.scan.filled.length ? `<p>${esc(ui.scan.filled.join(', '))}</p>` : '<p>Không dò được thông tin mới. Thử ảnh rõ hơn, chụp thẳng, đủ sáng.</p>'}
+      ${ui.scan.filled.length ? `<p>Đã điền: ${esc(ui.scan.filled.join(', '))}</p>` : '<p>Không dò được thông tin mới. Thử ảnh rõ hơn, chụp thẳng, đủ sáng; hoặc dùng "Quét tài liệu" trong ứng dụng Tệp của iPhone để có bản PDF phẳng, rõ.</p>'}
+      ${(() => { const m = missing(what === 'Vụ án' ? 'case' : 'person', what === 'Vụ án' ? ui.cdraft : ui.draft); return m.length ? `<p><b>Còn trống:</b> ${esc(m.join(', '))}</p>` : ''; })()}
       <details><summary>Xem chữ đọc được</summary><pre>${esc(ui.scan.text)}</pre></details></div>`;
   }
   function viewCaseForm() {
@@ -1021,6 +1028,7 @@
       return `<button class="row" data-act="openItem" data-kind="${it.kind}" data-id="${esc(it.id)}"><div class="main">
         <div class="name" style="white-space:normal">${esc(c ? c.ten : r.hoTen)}</div>
         <div class="sub" style="white-space:normal">${esc(c ? 'Vụ án' : 'Bị can')} · ${it.isNew ? 'tạo mới' : 'bổ sung vào hồ sơ đã có'} · điền ${it.filled.length} mục${r ? (vu ? ' · thuộc vụ: ' + esc(vu.ten) : ' · CHƯA GẮN VỤ ÁN') : ''}</div>
+        ${(() => { const m = missing(it.kind, c || r); return m.length ? `<div class="sub" style="white-space:normal;color:var(--orange)">Còn trống: ${esc(m.join(', '))}</div>` : ''; })()}
         <div class="sub">${esc(it.file)}</div></div><span class="chev">›</span></button>`;
     };
     const cs = pg.log.filter((x) => x.kind === 'case'); const ps = pg.log.filter((x) => x.kind === 'person'); const no = pg.log.filter((x) => x.kind === 'none');

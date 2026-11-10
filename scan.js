@@ -48,18 +48,55 @@ const Scan = (() => {
       img.src = url;
     });
   }
-  // Thu ảnh về cạnh dài tối đa 2600 px để iPhone không hết bộ nhớ.
+  // Đưa ảnh về cỡ vừa cho bộ đọc chữ: cạnh dài tối đa 2800 px, ảnh nhỏ thì phóng lên (tối đa 2 lần).
   function toCanvas(img) {
     const w = img.naturalWidth || img.width; const h = img.naturalHeight || img.height;
-    const k = Math.min(1, 2600 / Math.max(w, h));
+    const long = Math.max(w, h);
+    const k = long > 2800 ? 2800 / long : long < 1900 ? Math.min(2, 1900 / long) : 1;
     const c = document.createElement('canvas'); c.width = Math.round(w * k); c.height = Math.round(h * k);
-    const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+    const g = c.getContext('2d'); g.imageSmoothingQuality = 'high';
+    g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+    return enhance(c);
+  }
+  // Làm sạch ảnh chụp trước khi đọc chữ:
+  //  - chỉ lấy kênh đỏ: mực dấu đỏ gần như biến mất, chữ đen và chữ ký mực xanh vẫn đậm;
+  //  - chia cho độ sáng nền quanh đó để xoá bóng đổ, ánh sáng không đều;
+  //  - vùng nền tối ngoài trang giấy (mặt bàn) thành trắng.
+  function enhance(c) {
+    const g = c.getContext('2d'); const w = c.width; const h = c.height;
+    let im; try { im = g.getImageData(0, 0, w, h); } catch (e) { return c; }
+    const d = im.data; const n = w * h; const gray = new Uint8Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) gray[i] = d[j];
+    const B = 32; const bw = Math.ceil(w / B); const bh = Math.ceil(h / B); const bg = new Float32Array(bw * bh);
+    for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++) {
+      let m = 0; const y1 = Math.min(h, (by + 1) * B); const x1 = Math.min(w, (bx + 1) * B);
+      for (let y = by * B; y < y1; y += 2) for (let x = bx * B, o = y * w + x; x < x1; x += 2, o += 2) if (gray[o] > m) m = gray[o];
+      bg[by * bw + bx] = m;
+    }
+    // làm mượt nền theo ô 3x3
+    const sm = new Float32Array(bw * bh);
+    for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++) {
+      let t = 0; let k = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const yy = by + dy; const xx = bx + dx; if (yy >= 0 && yy < bh && xx >= 0 && xx < bw) { t += bg[yy * bw + xx]; k++; } }
+      sm[by * bw + bx] = t / k;
+    }
+    for (let y = 0; y < h; y++) {
+      const fy = Math.min(bh - 1, Math.max(0, y / B - 0.5)); const y0 = Math.floor(fy); const y1 = Math.min(bh - 1, y0 + 1); const ty = fy - y0;
+      for (let x = 0; x < w; x++) {
+        const fx = Math.min(bw - 1, Math.max(0, x / B - 0.5)); const x0 = Math.floor(fx); const x1 = Math.min(bw - 1, x0 + 1); const tx = fx - x0;
+        const b = (sm[y0 * bw + x0] * (1 - tx) + sm[y0 * bw + x1] * tx) * (1 - ty) + (sm[y1 * bw + x0] * (1 - tx) + sm[y1 * bw + x1] * tx) * ty;
+        const i = y * w + x; let v = b < 95 ? 255 : (gray[i] * 255) / b;
+        v = (v - 70) * (255 / 150); v = v < 0 ? 0 : v > 255 ? 255 : v;   // tăng tương phản
+        const j = i * 4; d[j] = d[j + 1] = d[j + 2] = v; d[j + 3] = 255;
+      }
+    }
+    g.putImageData(im, 0, 0);
     return c;
   }
   async function ocr(canvas, label, onProgress) {
     const w = await getWorker();
     report = (m) => { if (m.status === 'recognizing text') onProgress(`${label}: đang đọc chữ ${Math.round(m.progress * 100)}%`); else onProgress(`${label}: đang chuẩn bị bộ đọc chữ…`); };
-    const { data } = await w.recognize(canvas);
+    const { data } = await w.recognize(canvas, { rotateAuto: true });
     return data.text || '';
   }
   async function readPdf(file, onProgress) {
@@ -72,13 +109,19 @@ const Scan = (() => {
       const page = await doc.getPage(i);
       const tc = await page.getTextContent();
       let text = tc.items.map((it) => it.str + (it.hasEOL ? '\n' : ' ')).join('');
-      if (text.replace(/\s/g, '').length < 40) {
+      // Trang scan (không có lớp chữ), hoặc lớp chữ hỏng (phông chữ cũ VNI/TCVN3, lớp chữ do máy scan nhận dạng sai):
+      // khi không thấy các từ tiếng Việt quen thuộc thì vẽ trang ra ảnh và tự đọc chữ.
+      const ft = fold(text);
+      const hits = ['cong hoa', 'doc lap', 'quyet dinh', 'can cu', 'dieu', 'ngay', 'thang', 'nam', 'so', 'ho ten', 'bi can', 'vu an', 'hinh su'].filter((k) => new RegExp('\\b' + k + '\\b').test(ft)).length;
+      if (text.replace(/\s/g, '').length < 40 || hits < 3) {
+        const layer = text;
         // Trang scan (không có lớp chữ): vẽ ra ảnh rồi đọc chữ.
         const v0 = page.getViewport({ scale: 1 });
         const vp = page.getViewport({ scale: Math.min(3, 2400 / Math.max(v0.width, v0.height)) });
         const c = document.createElement('canvas'); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
         await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
-        text = await ocr(c, label, onProgress);
+        text = await ocr(enhance(c), label, onProgress);
+        if (text.replace(/\s/g, '').length < layer.replace(/\s/g, '').length / 4) text = layer;   // đọc ảnh còn kém hơn thì giữ lớp chữ
       }
       out.push(text);
     }
@@ -121,7 +164,9 @@ const Scan = (() => {
     }
     return o;
   }
-  const DATE = '(\\d{1,2})\\s*(?:[\\/\\-.]|thang)\\s*(\\d{1,2})\\s*(?:[\\/\\-.]|nam)\\s*(\\d{4})';
+  // "tháng", "năm" hay bị đọc sai một chữ (thúng, nam, nãm…) nên so khớp lỏng.
+  const THANG = 'th[a-z]{1,3}g'; const NAM = 'n[a-z]{1,2}m';
+  const DATE = `(\\d{1,2})[\\s.…]*(?:[\\/\\-]|${THANG})[\\s.…]*(\\d{1,2})[\\s.…]*(?:[\\/\\-]|${NAM})[\\s.…]*(\\d{4})`;
   function mkDate(d, m, y) {
     d = +d; m = +m; y = +y;
     if (!(d >= 1 && d <= 31 && m >= 1 && m <= 12 && y >= 1900 && y <= 2100)) return '';
@@ -131,7 +176,12 @@ const Scan = (() => {
     const [y, m, d] = iso.split('-').map(Number); const t = new Date(Date.UTC(y, m - 1, d) + n * 86400000);
     return `${t.getUTCFullYear()}-${pad2(t.getUTCMonth() + 1)}-${pad2(t.getUTCDate())}`;
   }
-  const clean = (v) => String(v || '').replace(/\s+/g, ' ').replace(/^[\s:;.,\-–—"“”'(]+|[\s:;.,\-–—"“”'(]+$/g, '').trim();
+  const clean = (v) => {
+    let t = String(v || '').replace(/(^|\s)['‘’`´](?=\p{L})/gu, '$1')          // dấu nháy lạc do đọc nhầm
+      .replace(/\s+/g, ' ').replace(/^[\s:;.,…\-–—"“”'(]+|[\s:;.,…\-–—"“”'(]+$/g, '').trim();
+    if ((t.match(/["“”]/g) || []).length === 1) t = /["“”]$/.test(t) ? t.slice(0, -1) : t + '"';   // ngoặc kép lẻ
+    return t;
+  };
   function titleCase(s) {
     if (s !== s.toUpperCase()) return s;
     return s.toLowerCase().replace(/(^|\s)(\S)/g, (m, a, b) => a + b.toUpperCase());
@@ -139,10 +189,11 @@ const Scan = (() => {
   const LABELS = /\b(ho\s*(va\s*)?ten|ten goi khac|gioi tinh|sinh ngay|ngay sinh|ngay,? thang,? nam sinh|sinh nam|nam sinh|noi sinh|que quan|quoc tich|dan toc|ton giao|nghe nghiep|trinh do|noi (dang ky )?thuong tru|noi cu tru|noi dkhktt|hktt|ho khau thuong tru|cho o|noi o|so cccd|cccd|cmnd|can cuoc|chung minh|so dinh danh|tien an|tien su|con ong|con ba|ho ten cha|ho ten me|vo|chong|bi bat|hien dang)\b/;
 
   // Tìm "nhãn: giá trị". short=true thì cắt thêm ở dấu phẩy / chấm.
-  function field(f, src, labels, short) {
+  function field(f, src, labels, short, raw) {
     const re = new RegExp(`(?:${labels})\\s*[:：]\\s*([^\\n;]*)`, 'd');
     const m = re.exec(f); if (!m) return '';
     let [a, b] = m.indices[1];
+    if (raw) return clean(src.slice(a, b));
     const cut = LABELS.exec(f.slice(a, b)); if (cut && cut.index > 0) b = a + cut.index;
     // Câu văn tiếp theo bị nối vào cùng dòng thì cắt bỏ.
     const stop = /\s(cac bi can|bi can|bi cao|bi khoi to|ve toi|da co hanh vi|hanh vi)\b/.exec(f.slice(a, b)); if (stop && stop.index > 0) b = a + stop.index;
@@ -167,20 +218,56 @@ const Scan = (() => {
     p.ngheNghiep = field(f, src, 'nghe nghiep', true);
     p.hktt = field(f, src, 'noi (?:dang ky )?thuong tru|noi dang ky ho khau thuong tru|ho khau thuong tru|noi dkhktt|hktt|noi cu tru');
     p.choO = field(f, src, 'cho o(?: hien nay| hien tai)?|noi o(?: hien nay| hien tai)?');
-    p.tienAn = field(f, src, 'tien an,?\\s*tien su');
+    p.tienAn = field(f, src, 'tien an,?\\s*tien su', false, true);
     return p;
   }
 
+  // Tên tội danh chuẩn (chương tội phạm về ma túy và một số tội thường gặp): bộ đọc chữ hay sai dấu
+  // ("Tầng trữ", "Mua bản"), so khớp không dấu rồi trả về cách viết đúng.
+  const CRIMES = ['Trồng cây thuốc phiện, cây côca, cây cần sa hoặc các loại cây khác có chứa chất ma túy', 'Sản xuất trái phép chất ma túy', 'Tàng trữ trái phép chất ma túy',
+    'Vận chuyển trái phép chất ma túy', 'Mua bán trái phép chất ma túy', 'Chiếm đoạt chất ma túy', 'Tàng trữ, vận chuyển, mua bán hoặc chiếm đoạt tiền chất dùng vào việc sản xuất trái phép chất ma túy',
+    'Sản xuất, tàng trữ, vận chuyển hoặc mua bán phương tiện, dụng cụ dùng vào việc sản xuất hoặc sử dụng trái phép chất ma túy', 'Tổ chức sử dụng trái phép chất ma túy',
+    'Chứa chấp việc sử dụng trái phép chất ma túy', 'Cưỡng bức người khác sử dụng trái phép chất ma túy', 'Lôi kéo người khác sử dụng trái phép chất ma túy',
+    'Vi phạm quy định về quản lý chất ma túy, tiền chất, thuốc gây nghiện, thuốc hướng thần', 'Tàng trữ, vận chuyển trái phép chất ma túy', 'Mua bán, vận chuyển trái phép chất ma túy',
+    'Tàng trữ, mua bán trái phép chất ma túy', 'Trộm cắp tài sản', 'Cướp tài sản', 'Cướp giật tài sản', 'Cố ý gây thương tích', 'Giết người', 'Lừa đảo chiếm đoạt tài sản',
+    'Lạm dụng tín nhiệm chiếm đoạt tài sản', 'Đánh bạc', 'Tổ chức đánh bạc', 'Gây rối trật tự công cộng', 'Chống người thi hành công vụ', 'Tàng trữ, vận chuyển, sử dụng trái phép vũ khí quân dụng'];
+  const squash = (v) => fold(v).replace(/[^a-z0-9]+/g, ' ').trim();
+  const CRIME_MAP = new Map(CRIMES.map((c) => [squash(c), c]));
+  function fixCrime(v) {
+    const k = squash(v); if (CRIME_MAP.has(k)) return CRIME_MAP.get(k);
+    // sai 1–2 chữ cái do đọc nhầm: chọn tên chuẩn gần nhất nếu đủ giống
+    let best = ''; let bd = 3;
+    for (const [ck, c] of CRIME_MAP) { if (Math.abs(ck.length - k.length) > 2) continue; const d = lev(ck, k, 2); if (d < bd) { bd = d; best = c; } }
+    return best || v;
+  }
+  function lev(a, b, max) {
+    let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = [i]; let rowMin = i;
+      for (let j = 1; j <= b.length; j++) { cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); if (cur[j] < rowMin) rowMin = cur[j]; }
+      if (rowMin > max) return max + 1;
+      prev = cur;
+    }
+    return prev[b.length];
+  }
+  // Viết lại điều khoản từ bản không dấu để khỏi dính lỗi dấu ("Khoán 1 Điều 249").
+  function fixClause(k) {
+    const d = /diem\s+([a-z](?:\s*,\s*[a-z])*)/.exec(k); const kh = /kho[a-z]n\s+(\d+)/.exec(k); const dieu = /di[a-z]u\s+(\d+[a-z]?)/.exec(k);
+    if (!dieu) return '';
+    const out = [d ? `điểm ${d[1].replace(/\s+/g, '')}` : '', kh ? `khoản ${kh[1]}` : '', `Điều ${dieu[1]}`].filter(Boolean).join(' ');
+    return out.charAt(0).toUpperCase() + out.slice(1);
+  }
   function crimeFields(f, src) {
     const o = {};
     const t = /ve toi(?!\s*pham\b)\s*[:：]?\s*["“”']?\s*([^\n]{3,160}?)\s*["“”']?\s*[,.]?\s*(?:quy dinh tai|theo quy dinh|theo (?:diem|khoan|dieu)|pham vao|xay ra)/d.exec(f)
+      || /hanh vi pham toi\s*[:：]?\s*["“”']?\s*([^\n]{3,160}?)\s*["“”']?\s*[,.]?\s*(?:quy dinh tai|theo quy dinh|theo (?:diem|khoan|dieu))/d.exec(f)
       || /toi danh\s*[:：]\s*([^\n;]{3,160})/d.exec(f)
       || /ve toi(?!\s*pham\b)\s*[:：]?\s*["“”']?\s*([^\n;.,]{3,120})/d.exec(f);
-    if (t) o.toiDanh = clean(src.slice(t.indices[1][0], t.indices[1][1]));
+    if (t) o.toiDanh = fixCrime(clean(src.slice(t.indices[1][0], t.indices[1][1])));
     // Lấy chỗ ghi đầy đủ nhất (có điểm, khoản) trong các lần nhắc tới điều luật.
-    const dk = [...f.matchAll(/((?:diem\s+[a-z](?:\s*,\s*[a-z])*\s*,?\s*)?(?:khoan\s+\d+\s*,?\s*)?dieu\s+\d+[a-z]?)\s*(?:cua\s*)?(?:bo luat hinh su|blhs)/gd)]
+    const dk = [...f.matchAll(/((?:diem\s+[a-z](?:\s*,\s*[a-z])*\s*,?\s*)?(?:kho[a-z]n\s+\d+\s*,?\s*)?di[a-z]u\s+\d+[a-z]?)\s*(?:cua\s*)?(?:bo luat hinh su|blhs)/g)]
       .sort((x, y) => y[1].length - x[1].length)[0];
-    if (dk) o.dieuKhoan = clean(src.slice(dk.indices[1][0], dk.indices[1][1])).replace(/^./, (c) => c.toUpperCase());
+    if (dk) o.dieuKhoan = fixClause(dk[1]);
     return o;
   }
 
@@ -196,10 +283,18 @@ const Scan = (() => {
     const o = {};
     let type = ''; let pos = Infinity;
     for (const [k, re] of TYPES) { const m = re.exec(f); if (m && m.index < pos) { pos = m.index; type = k; } }
-    // Số văn bản, kể cả khi bị đọc thành "27 /QĐ-CSMT" (có khoảng trắng quanh dấu gạch chéo).
-    const so = /\bso\s*[:：]\s*(\d+\s?\/\s?[^\s,;]+|\S*\d\S*)/d.exec(f);
-    const docSo = so ? clean(src.slice(so.indices[1][0], so.indices[1][1])).replace(/\s*\/\s*/g, '/') : '';
-    const dn = /ngay\s*(\d{1,2})\s*thang\s*(\d{1,2})\s*nam\s*(\d{4})/.exec(f);
+    // Số và ngày của chính văn bản nằm ở phần đầu (trước tên loại văn bản / trước "Căn cứ"),
+    // không lấy nhầm số của quyết định được viện dẫn bên dưới.
+    const cc = f.search(/\bcan cu\b/);
+    const headEnd = Math.min(pos === Infinity ? 700 : pos + 60, cc > 40 ? cc : Infinity, f.length);
+    const head = f.slice(0, headEnd);
+    // Dạng "Số: 27/QĐ-CSMT", "Số: ....27..../QĐ-CSMT" (dấu chấm dẫn), hoặc mất chữ "Số" do dấu đè: "27/QĐ-…".
+    const sm = /\bs[o0]\s*[:：;.]?[\s.…]*(\d{1,6})[\s.…]*\/[\s.…]*([^\s,;]+)/d.exec(head)
+      || /(?:^|[\s.…])(\d{1,6})[\s.…]*\/[\s.…]*((?:qd|ltg|lbtg|lcd|kl|kldt|tb|l)[^\s,;]*)/d.exec(head);
+    const s1 = sm ? null : /\bs[o0]\s*[:：]\s*(\S*\d\S*)/d.exec(head);
+    const docSo = sm ? `${sm[1]}/${clean(src.slice(sm.indices[2][0], sm.indices[2][1]))}` : s1 ? clean(src.slice(s1.indices[1][0], s1.indices[1][1])) : '';
+    const NGAY = new RegExp(`ngay[\\s.…]*(\\d{1,2})[\\s.…]*${THANG}[\\s.…]*(\\d{1,2})[\\s.…]*${NAM}[\\s.…]*(\\d{4})`);
+    const dn = NGAY.exec(head) || NGAY.exec(f);
     const docNgay = dn ? mkDate(dn[1], dn[2], dn[3]) : '';
 
     const ref = (name) => {
@@ -233,11 +328,15 @@ const Scan = (() => {
     o.docType = type;
 
     const ng = /(tr[aạ]i t[aạ]m giam|nh[aà] t[aạ]m gi[uữ]|trai tam giam|nha tam giu|co so giam giu)[^\n,;.]{0,60}/d.exec(f);
-    if (ng) o.noiGiam = clean(src.slice(ng.indices[0][0], ng.indices[0][1])).replace(/^./, (c) => c.toUpperCase());
+    if (ng) {
+      const a = ng.indices[0][0]; let b = ng.indices[0][1];
+      const cut = /\s(de|va|theo|ke tu|trong|thuoc|cong an|bo cong an)\s/.exec(f.slice(a, b)); if (cut && cut.index > 12) b = a + cut.index;
+      o.noiGiam = clean(src.slice(a, b)).replace(/^./, (c) => c.toUpperCase());
+    }
     const nb = new RegExp(`(?:bi bat|bat giu|bat qua tang|bi tam giu|tam giu)[^\\n\\d]{0,25}?ngay\\s*${DATE}`).exec(f);
     if (nb) o.ngayBat = mkDate(nb[1], nb[2], nb[3]);
     // Tên vụ án: phần đứng sau "(khởi tố) vụ án hình sự …" cho tới hết câu, bỏ đoạn viện dẫn điều luật.
-    for (const m of f.matchAll(/vu an(?: hinh su)?[ ]*[:：]?[ ]*(?:ve toi[ ]*[:：]?[ ]*)?(["“”']?[^\n;]{6,240})/gd)) {
+    for (const m of (type === 'ktva' ? f.matchAll(/khoi to vu an(?: hinh su)?[ ]*[:：]?[ ]*(?:ve toi[ ]*[:：]?[ ]*)?(["“”']?[^\n;]{6,240})/gd) : [])) {
       const a = m.indices[1][0]; let b = m.indices[1][1]; const seg = f.slice(a, b);
       // Bỏ qua tiêu đề văn bản viết hoa (QUYẾT ĐỊNH KHỞI TỐ VỤ ÁN HÌNH SỰ) và dòng chức danh người ký đứng sau nó.
       const lead = src.slice(m.index, a);
@@ -248,7 +347,7 @@ const Scan = (() => {
       const raw = src.slice(a, b); const name = clean(raw.replace(/["“”]/g, ' '));
       if (name.length < 6) continue;
       o.vuAn = name;
-      const q = /^\s*["“”']\s*([^"“”']{3,120})["“”']/.exec(raw); if (q) o.toiDanhVuAn = clean(q[1]);
+      const q = /^\s*["“”']\s*([^"“”']{3,120})["“”']/.exec(raw); if (q) o.toiDanhVuAn = fixCrime(clean(q[1]));
       break;
     }
     // Địa bàn xảy ra: "xảy ra (ngày …) tại <địa bàn>".
@@ -259,12 +358,19 @@ const Scan = (() => {
       if (cut) b = a + cut.index;
       o.diaBan = clean(src.slice(a, b));
     }
+    // Quyết định khởi tố vụ án không có cụm "xảy ra … tại": lấy "tại phường/xã …" đầu tiên trong phần quyết định.
+    if (!o.diaBan && type === 'ktva') {
+      const t = /\btai\s+((?:phuong|xa|thi tran|dac khu)\s+[^\n,;.]+(?:,\s*(?:thanh pho|tinh|tp|quan|huyen)[^\n,;.]*){0,2})/d.exec(f.slice(pos === Infinity ? 0 : pos));
+      if (t) { const off = pos === Infinity ? 0 : pos; o.diaBan = clean(src.slice(off + t.indices[1][0], off + t.indices[1][1])); }
+    }
     o.dtv = titleCase(field(f, src, 'dieu tra vien(?: thu ly)?', true));
     o.ksv = titleCase(field(f, src, 'kiem sat vien(?: thu ly)?', true));
     return o;
   }
 
   const NAME_RE = 'ho\\s*(?:va\\s*)?ten(?:\\s*(?:bi can|bi cao|khai sinh))?\\s*[:：]\\s*([^\\n;]*)';
+  // Họ tên hợp lệ: 2–7 từ, chỉ gồm chữ cái.
+  const isName = (v) => /^[\p{L}]+(?:\s[\p{L}]+){1,6}$/u.test(v) && v.length <= 50;
   function nameFrom(f, src, a, b) {
     const cut = LABELS.exec(f.slice(a, b)); if (cut && cut.index > 0) b = a + cut.index;
     // Bộ đọc chữ hay nhầm họ NGUYỄN thành NGUYÊN.
@@ -289,7 +395,7 @@ const Scan = (() => {
   }
 
   function parse(text) {
-    const src = unwrap(String(text || '').normalize('NFC').replace(/\r/g, '').replace(/[ \t\u00a0]+/g, ' '));
+    const src = unwrap(String(text || '').normalize('NFC').replace(/Ð/g, 'Đ').replace(/ð/g, 'đ').replace(/[⁄∕／]/g, '/').replace(/\r/g, '').replace(/[ \t\u00a0]+/g, ' '));
     const f = fold(src);
     const common = Object.assign(commonFields(f, src), crimeFields(f, src));
     const type = common.docType || ''; delete common.docType;
@@ -298,10 +404,12 @@ const Scan = (() => {
     // Quyết định khởi tố vụ án không ghi rõ tên vụ thì ghép tên từ tội danh và địa bàn.
     if (type === 'ktva' && !common.vuAn && common.toiDanh) common.vuAn = common.toiDanh;
     if (type === 'ktva' && common.vuAn) {
-      if (!common.toiDanh) common.toiDanh = clean(common.vuAn.split(/\s+xảy ra\b/i)[0]);
+      if (!common.toiDanh) common.toiDanh = fixCrime(clean(common.vuAn.split(/\s+xảy ra\b/i)[0]));
+      // tên vụ ghép lại từ tội danh đã chuẩn hoá và địa bàn
+      if (common.toiDanh && common.diaBan) common.vuAn = common.toiDanh + ' xảy ra tại ' + common.diaBan;
       if (common.diaBan && !/xảy ra/i.test(common.vuAn)) common.vuAn += ' xảy ra tại ' + common.diaBan;
     }
-    const marks = [...f.matchAll(new RegExp(NAME_RE, 'gd'))].filter((m) => m.indices[1][1] > m.indices[1][0]);
+    const marks = [...f.matchAll(new RegExp(NAME_RE, 'gd'))].filter((m) => m.indices[1][1] > m.indices[1][0] && isName(nameFrom(f, src, m.indices[1][0], m.indices[1][1])));
     const persons = [];
     if (marks.length) {
       marks.forEach((m, i) => {
@@ -314,8 +422,16 @@ const Scan = (() => {
         persons.push(p);
       });
     } else {
-      const m = /(?:khoi to bi can|tam giam|tam giu|bat bi can de tam giam|gia han tam giam)\s*doi voi\s*(?:bi can|ong|ba)?\s*[:：]?\s*([^\n,;:(]{3,60})/d.exec(f);
-      const p = m ? { hoTen: nameFrom(f, src, m.indices[1][0], m.indices[1][1]) } : {};
+      // Không có dòng "Họ tên:": tìm tên sau "đối với (bị can/ông/bà) …", "bị can: …".
+      let hoTen = '';
+      for (const m of f.matchAll(/(?:doi voi|bi can|bi cao)\s*(?:bi can|\(?ong\/ba\)?|ong|ba)?\s*[:：]?\s*([^\n,;:(]{3,60})/gd)) {
+        const a = m.indices[1][0]; let b = m.indices[1][1];
+        const stop = /\s(ve toi|sinh|gioi tinh|la|da|co|bi|thuoc|trong|tai|ve|do|nhu|de)\b/.exec(f.slice(a, b)); if (stop) b = a + stop.index;
+        const cand = nameFrom(f, src, a, b);
+        // tên người viết hoa chữ đầu mỗi từ
+        if (isName(cand) && cand.split(' ').every((w) => w[0] === w[0].toUpperCase() && w[0] !== w[0].toLowerCase())) { hoTen = cand; break; }
+      }
+      const p = hoTen ? { hoTen } : {};
       Object.assign(p, personFields(f, src));
       persons.push(p);
     }
@@ -329,5 +445,5 @@ const Scan = (() => {
 
   async function dispose() { if (worker) { const w = worker; worker = null; try { await w.terminate(); } catch (e) { /* bỏ qua */ } } }
 
-  return { read, readDocs, parse, dispose };
+  return { read, readDocs, parse, dispose, toCanvas, fileToImage };
 })();
