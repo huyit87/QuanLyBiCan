@@ -170,6 +170,7 @@ const Scan = (() => {
 
   const TYPES = [
     ['kldtbs', /ban ket luan dieu tra bo sung|ket luan dieu tra bo sung/], ['kldt', /ban ket luan dieu tra/],
+    ['tdc', /quyet dinh tam dinh chi/], ['dc', /quyet dinh dinh chi/],
     ['giahan', /quyet dinh gia han tam giam/], ['ktbc', /quyet dinh khoi to bi can/], ['ktva', /quyet dinh khoi to vu an/],
     ['tamgiam', /lenh tam giam|lenh bat bi can de tam giam/], ['tamgiu', /quyet dinh tam giu/], ['camdi', /lenh cam di khoi noi cu tru/],
   ];
@@ -210,6 +211,8 @@ const Scan = (() => {
     if (!type && tu) { o.tgTu = tu; if (den) o.tgDen = den; }
     if (type === 'kldt') { if (docSo) o.soKLDT = docSo; if (docNgay) o.ngayKLDT = docNgay; }
     if (type === 'kldtbs') o.dtbs = [{ so: docSo, ngayKL: docNgay }];
+    if (type === 'tdc') { if (docSo) o.soTDC = docSo; if (docNgay) o.ngayTDC = docNgay; }
+    if (type === 'dc') { if (docSo) o.soDC = docSo; if (docNgay) o.ngayDC = docNgay; }
     o.docType = type;
 
     const ng = /(tr[aạ]i t[aạ]m giam|nh[aà] t[aạ]m gi[uữ]|trai tam giam|nha tam giu|co so giam giu)[^\n,;.]{0,60}/d.exec(f);

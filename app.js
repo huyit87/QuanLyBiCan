@@ -36,8 +36,9 @@
     { ten: '3 tháng', ngay: 90 },
     { ten: '4 tháng', ngay: 120 },
   ];
-  const defaultSettings = () => ({ alertDays: 10, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
-  const APP_VERSION = '6'; // tăng cùng lúc với VERSION trong sw.js
+  // statDay/statMonth: ngày bắt đầu kỳ thống kê năm (mặc định 15/11: năm 2026 là 15/11/2025 – 14/11/2026).
+  const defaultSettings = () => ({ alertDays: 10, statDay: 15, statMonth: 11, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
+  const APP_VERSION = '7'; // tăng cùng lúc với VERSION trong sw.js
   const PBKDF2_ITER = 310000;
   const AUTO_LOCK_MS = 60 * 1000;
 
@@ -142,16 +143,29 @@
     records = out;
     const crows = await tx('vuan', 'readonly', (s) => s.getAll());
     const cs = [];
-    for (const row of crows) cs.push(await unseal(key, row));
+    for (const row of crows) cs.push(normCase(await unseal(key, row)));
     cases = cs;
     await syncCases();
   }
   // Bổ sung các trường mới cho hồ sơ tạo từ phiên bản cũ.
   function normalize(r) {
     r.giaHan = r.giaHan || []; r.dtbs = r.dtbs || [];
-    r.loaiHan = r.loaiHan || ''; r.soKLDT = r.soKLDT || ''; r.ngayKLDT = r.ngayKLDT || '';
+    for (const k of ['loaiHan', 'soKLDT', 'ngayKLDT', 'soDC', 'ngayDC', 'soTDC', 'ngayTDC']) r[k] = r[k] || '';
     return r;
   }
+  function normCase(c) { for (const k of ['soKLDT', 'ngayKLDT', 'soDC', 'ngayDC', 'soTDC', 'ngayTDC', 'ghiChu']) c[k] = c[k] || ''; return c; }
+  // Ghi ngày đình chỉ / tạm đình chỉ mới thì chuyển giai đoạn tương ứng.
+  function stageFromStop(r, old) {
+    if (r.ngayDC && (!old || old.ngayDC !== r.ngayDC)) r.giaiDoan = 'dinhchi';
+    else if (r.ngayTDC && (!old || old.ngayTDC !== r.ngayTDC)) r.giaiDoan = 'tamdinhchi';
+  }
+  // ---------- Kỳ thống kê ----------
+  const pad = (n) => String(n).padStart(2, '0');
+  const statMD = () => `${pad(settings.statMonth || 1)}-${pad(settings.statDay || 1)}`;
+  const fromJan = () => statMD() === '01-01';
+  // Kỳ năm Y: [bắt đầu, kết thúc) — ví dụ mốc 15/11: 15/11/(Y-1) đến hết 14/11/Y.
+  const periodStart = (y) => `${fromJan() ? y : y - 1}-${statMD()}`;
+  const periodOf = (d) => { const y = Number(d.slice(0, 4)); return fromJan() || d < `${y}-${statMD()}` ? y : y + 1; };
   // Tự đặt giai đoạn theo kết luận điều tra / điều tra bổ sung (không đụng tới đình chỉ, tạm đình chỉ).
   function autoStage(r) {
     if (['dinhchi', 'tamdinhchi'].includes(r.giaiDoan)) return;
@@ -185,7 +199,7 @@
   }
   const caseByName = (name) => { const k = normName(name); return k ? cases.find((c) => normName(c.ten) === k) : undefined; };
   function blankCase(ten = '') {
-    return { id: uid(), ten, soQDKTVA: '', ngayKTVA: '', toiDanh: '', dieuKhoan: '', dtv: '', soKLDT: '', ngayKLDT: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
+    return { id: uid(), ten, soQDKTVA: '', ngayKTVA: '', toiDanh: '', dieuKhoan: '', dtv: '', soKLDT: '', ngayKLDT: '', soDC: '', ngayDC: '', soTDC: '', ngayTDC: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
   }
   const CASE_SEED = ['soQDKTVA', 'ngayKTVA', 'toiDanh', 'dieuKhoan', 'dtv'];
   // Bảo đảm tên vụ án ghi trong hồ sơ bị can luôn có trong danh sách vụ án.
@@ -207,9 +221,13 @@
     for (const k of ['soQDKTVA', 'ngayKTVA']) if (!r[k] && c[k]) r[k] = c[k];
   }
   const casePeople = (c) => records.filter((r) => normName(r.vuAn) === normName(c.ten));
+  const first = (list, k) => list.map((r) => r[k]).filter(Boolean).sort()[0] || '';
+  const caseDate = (c, rs) => c.ngayKTVA || first(rs || casePeople(c), 'ngayKTVA');
   function caseStatus(c, rs) {
     const any = (...g) => rs.some((r) => g.includes(r.giaiDoan));
     if (any('dtbs')) return 'dtbs';
+    if (!rs.length && c.ngayDC) return 'dinhchi';
+    if (!rs.length && c.ngayTDC) return 'tamdinhchi';
     if (any('dieutra') || (!rs.length && !c.ngayKLDT)) return 'dieutra';
     if (any('ketluan', 'truyto', 'xetxu') || c.ngayKLDT) return 'ketluan';
     if (any('tamdinhchi')) return 'tamdinhchi';
@@ -381,38 +399,59 @@
   const so = (num, date) => [num ? `số ${num}` : '', date ? `ngày ${vn(date)}` : ''].filter(Boolean).join(', ');
   const SCAN_INPUT = '<input id="scanFile" type="file" accept="image/*,application/pdf,.pdf" multiple hidden>';
   function viewCases() {
-    const list = [...cases].sort((a, b) => fold(a.ten).localeCompare(fold(b.ten)));
+    // Sắp theo ngày khởi tố vụ án (cũ trước, mới sau); vụ chưa ghi ngày khởi tố nằm cuối.
+    const list = cases.map((c) => { const rs = casePeople(c); return { c, rs, kt: caseDate(c, rs) }; })
+      .sort((a, b) => (a.kt || '9999').localeCompare(b.kt || '9999') || fold(a.c.ten).localeCompare(fold(b.c.ten)));
     const loose = records.filter((r) => !normName(r.vuAn));
     return `${bar('Vụ án')}
     <main class="content">
-      <button class="btn" style="margin-top:0" data-act="newScan">Thêm vụ án từ văn bản (QĐ khởi tố vụ án)</button>
+      <h3 class="section-title">${list.length} vụ án đang quản lý — theo ngày khởi tố</h3>
+      ${list.length || loose.length ? `<div class="card">${list.map(({ c, rs, kt }, i) => {
+        const st = caseStatus(c, rs);
+        return `<button class="row" data-act="case" data-name="${esc(c.ten)}"><div class="main"><div class="name" style="white-space:normal">${i + 1}. ${esc(c.ten)}</div>
+          <div class="sub" style="white-space:normal">${esc([kt ? 'Khởi tố ' + vn(kt) : 'Chưa ghi ngày khởi tố', c.soQDKTVA ? 'QĐ số ' + c.soQDKTVA : '', `${rs.length} bị can`].filter(Boolean).join(' · '))}</div></div>
+          <div class="right"><span class="tag ${st === 'dtbs' ? 'orange' : st === 'dieutra' ? 'blue' : st === 'ketluan' ? 'green' : ''}">${esc(GIAI_DOAN[st])}</span></div></button>`;
+      }).join('')}${loose.length ? `<button class="row" data-act="case" data-name=""><div class="main"><div class="name">Bị can chưa gắn vụ án</div><div class="sub">${loose.length} bị can</div></div><span class="chev">›</span></button>` : ''}</div>`
+      : '<div class="empty">Chưa có vụ án nào.</div>'}
+      <button class="btn" data-act="newScan">Thêm vụ án từ văn bản (QĐ khởi tố vụ án)</button>
       <button class="btn plain" data-act="newCase">Thêm vụ án nhập tay</button>
       ${SCAN_INPUT}
-      <h3 class="section-title">${list.length} vụ án</h3>
-      ${list.length || loose.length ? `<div class="card">${list.map((c) => {
-        const rs = casePeople(c); const st = caseStatus(c, rs);
-        return `<button class="row" data-act="case" data-name="${esc(c.ten)}"><div class="main"><div class="name" style="white-space:normal">${esc(c.ten)}</div>
-          <div class="sub">${esc([so(c.soQDKTVA, c.ngayKTVA) ? 'QĐ ' + so(c.soQDKTVA, c.ngayKTVA) : '', `${rs.length} bị can`].filter(Boolean).join(' · '))}</div></div>
-          <div class="right"><span class="tag ${st === 'dtbs' ? 'orange' : st === 'dieutra' ? 'blue' : st === 'ketluan' ? 'green' : ''}">${esc(GIAI_DOAN[st])}</span></div></button>`;
-      }).join('')}${loose.length ? `<button class="row" data-act="case" data-name=""><div class="main"><div class="name">Chưa gắn vụ án</div><div class="sub">${loose.length} bị can</div></div><span class="chev">›</span></button>` : ''}</div>`
-      : '<div class="empty">Chưa có vụ án nào.</div>'}
     </main>`;
+  }
+  // Thẻ thông tin bị can trong trang vụ án.
+  function personCard(r, i) {
+    const d = dlInfo(r); const bs = r.dtbs[r.dtbs.length - 1];
+    const line = (k, v) => (v ? `<div class="pl"><span>${esc(k)}</span><div>${esc(v)}</div></div>` : '');
+    return `<button class="pcard" data-act="open" data-id="${esc(r.id)}">
+      <div class="pc-head">${avatar(r)}<div class="main"><div class="name">${i + 1}. ${esc(r.hoTen)}</div>
+        <div class="sub">${esc([r.ngaySinh ? 'Sinh ' + vn(r.ngaySinh) : '', r.cccd ? 'CCCD ' + r.cccd : ''].filter(Boolean).join(' · '))}</div></div><span class="chev">›</span></div>
+      <div class="pc-tags">${bpTag(r)}<span class="tag">${esc(GIAI_DOAN[r.giaiDoan] || '')}</span>${d ? `<span class="tag ${d.level}">${esc(d.text)}</span>` : ''}</div>
+      ${line('Khởi tố bị can', so(r.soQDKTBC, r.ngayKTBC))}
+      ${line('Tội danh', [r.toiDanh, r.dieuKhoan].filter(Boolean).join(' — '))}
+      ${line('Hạn giam giữ', d ? `đến ${vn(d.date)}${r.noiGiam ? ' · ' + r.noiGiam : ''}` : '')}
+      ${line('Nơi thường trú', r.hktt)}
+      ${line('Kết luận điều tra', so(r.soKLDT, r.ngayKLDT))}
+      ${line('Điều tra bổ sung', bs ? `Lần ${r.dtbs.length}, ${CO_QUAN_TRA[bs.gd] || CO_QUAN_TRA.vks}${bs.ngayTra ? ' ' + vn(bs.ngayTra) : ''}${bs.ngayKL ? '; đã kết luận bổ sung ' + vn(bs.ngayKL) : '; chưa kết luận bổ sung'}` : '')}
+      ${line('Tạm đình chỉ', so(r.soTDC, r.ngayTDC))}
+      ${line('Đình chỉ', so(r.soDC, r.ngayDC))}
+    </button>`;
   }
   function viewCase(name) {
     const c = caseByName(name);
-    const rs = (c ? casePeople(c) : records.filter((r) => !normName(r.vuAn))).sort(byName);
+    const rs = (c ? casePeople(c) : records.filter((r) => !normName(r.vuAn))).sort((a, b) => (a.ngayKTBC || '9999').localeCompare(b.ngayKTBC || '9999') || byName(a, b));
+    const people = rs.map((r, i) => personCard(r, i)).join('');
     if (!c) {
       return `${bar('Chưa gắn vụ án', '<button data-act="back">‹ Quay lại</button>')}
       <main class="content nopad-bottom"><p class="note" style="margin-bottom:8px">Mở từng hồ sơ, bấm Sửa và chọn tên vụ án để gắn bị can vào vụ.</p>
-      <div class="card">${rs.map((r) => personRow(r)).join('') || '<div class="empty">Không có bị can nào.</div>'}</div></main>`;
+      ${people || '<div class="card"><div class="empty">Không có bị can nào.</div></div>'}</main>`;
     }
     return `${bar('Vụ án', '<button data-act="back">‹ Quay lại</button>', `<button class="strong" data-act="editCase" data-id="${esc(c.id)}">Sửa</button>`)}
     <main class="content nopad-bottom">
       <div class="card pad"><h2 style="font-size:18px">${esc(c.ten)}</h2><div style="margin-top:6px"><span class="tag">${esc(GIAI_DOAN[caseStatus(c, rs)])}</span></div></div>
-      ${block('Thông tin vụ án', [kv('QĐ khởi tố vụ án', so(c.soQDKTVA, c.ngayKTVA)), kv('Tội danh', c.toiDanh), kv('Điều khoản BLHS', c.dieuKhoan),
-        kv('Điều tra viên', c.dtv), kv('Kết luận điều tra', so(c.soKLDT, c.ngayKLDT)), kv('Ghi chú', c.ghiChu)])}
-      <h3 class="section-title">Bị can (${rs.length})</h3>
-      <div class="card">${rs.map((r) => personRow(r)).join('') || '<div class="empty">Chưa có bị can nào trong vụ này.</div>'}</div>
+      ${block('Thông tin vụ án', [kv('QĐ khởi tố vụ án', so(c.soQDKTVA, caseDate(c, rs))), kv('Tội danh', c.toiDanh), kv('Điều khoản BLHS', c.dieuKhoan),
+        kv('Điều tra viên', c.dtv), kv('Kết luận điều tra', so(c.soKLDT, c.ngayKLDT)), kv('Tạm đình chỉ', so(c.soTDC, c.ngayTDC)), kv('Đình chỉ', so(c.soDC, c.ngayDC)), kv('Ghi chú', c.ghiChu)])}
+      <h3 class="section-title">Bị can bị khởi tố (${rs.length})</h3>
+      ${people || '<div class="card"><div class="empty">Chưa có bị can nào trong vụ này.</div></div>'}
       <button class="btn" data-act="new">Thêm bị can vào vụ này</button>
       ${rs.length ? '' : `<button class="btn danger" data-act="delCase" data-id="${esc(c.id)}">Xoá vụ án</button>`}
     </main>`;
@@ -447,7 +486,14 @@
         ${inp('Bản kết luận điều tra số', 'soKLDT', c.soKLDT)}
         ${inp('Ngày kết luận điều tra', 'ngayKLDT', c.ngayKLDT, 'date')}
       </div>
-      <p class="note">Khi lưu, ngày kết luận điều tra của vụ án được điền cho các bị can trong vụ chưa có ngày kết luận.</p>
+      <h3 class="section-title">Tạm đình chỉ, đình chỉ vụ án</h3>
+      <div class="card">
+        ${inp('Quyết định tạm đình chỉ số', 'soTDC', c.soTDC)}
+        ${inp('Ngày tạm đình chỉ', 'ngayTDC', c.ngayTDC, 'date')}
+        ${inp('Quyết định đình chỉ số', 'soDC', c.soDC)}
+        ${inp('Ngày đình chỉ', 'ngayDC', c.ngayDC, 'date')}
+      </div>
+      <p class="note">Khi lưu, ngày kết luận, tạm đình chỉ, đình chỉ của vụ án được điền cho các bị can trong vụ chưa có các ngày này.</p>
       <h3 class="section-title">Ghi chú</h3>
       <div class="card">${area('Ghi chú', 'ghiChu', c.ghiChu)}</div>
       <button type="button" class="btn" data-act="saveCase">Lưu vụ án</button>
@@ -461,58 +507,72 @@
   // ---------- Thống kê ----------
   const ST_FIELDS = [['vuAn', 'Vụ án'], ['dtv', 'Điều tra viên'], ['ksv', 'Kiểm sát viên'], ['toiDanh', 'Tội danh'], ['bienPhap', 'Biện pháp ngăn chặn'], ['giaiDoan', 'Giai đoạn']];
   function statsData() {
-    const f = ui.st; const Y = f.nam; const start = `${Y}-01-01`;
+    const f = ui.st; const Y = f.nam ? Number(f.nam) : 0;
+    const start = Y ? periodStart(Y) : ''; const end = Y ? periodStart(Y + 1) : '';
     const personFilter = ['dtv', 'ksv', 'toiDanh', 'bienPhap', 'giaiDoan'].some((k) => f[k]);
     const rs = records.filter((r) => ['dtv', 'ksv', 'toiDanh', 'bienPhap', 'giaiDoan'].every((k) => !f[k] || r[k] === f[k]) && (!f.vuAn || normName(r.vuAn) === normName(f.vuAn)));
     const byCase = new Map();
     for (const r of rs) { const k = normName(r.vuAn); if (!k) continue; if (!byCase.has(k)) byCase.set(k, []); byCase.get(k).push(r); }
-    const first = (list, k) => list.map((r) => r[k]).filter(Boolean).sort()[0] || '';
     const cs = cases.filter((c) => (!f.vuAn || normName(c.ten) === normName(f.vuAn)) && (byCase.has(normName(c.ten)) || !personFilter)).map((c) => {
       const list = byCase.get(normName(c.ten)) || [];
-      return { c, rs: list, kt: c.ngayKTVA || first(list, 'ngayKTVA'), kl: c.ngayKLDT || first(list, 'ngayKLDT'), st: caseStatus(c, list) };
+      return { c, rs: list, kt: caseDate(c, list), kl: c.ngayKLDT || first(list, 'ngayKLDT'), st: caseStatus(c, list) };
     });
-    const inY = (d) => !!d && d.slice(0, 4) === Y;
+    const inY = (d) => !!d && d >= start && d < end;
     const stopped = (g) => g === 'dinhchi' || g === 'tamdinhchi';
-    // Còn tồn ở đầu năm: chưa kết luận trước 01/01, hoặc đã kết luận nhưng bị trả điều tra bổ sung chưa xong trước 01/01.
-    const openAtStart = (r) => !stopped(r.giaiDoan) && !(r.ngayKLDT && r.ngayKLDT < start && r.dtbs.every((b) => b.ngayKL && b.ngayKL < start));
+    // Còn tồn ở đầu kỳ: tới ngày bắt đầu kỳ chưa đình chỉ / tạm đình chỉ, và chưa kết luận
+    // (hoặc đã kết luận nhưng bị trả điều tra bổ sung chưa xong).
+    const openAtStart = (r) => {
+      if (r.ngayDC ? r.ngayDC < start : r.giaiDoan === 'dinhchi') return false;
+      if (r.giaiDoan === 'tamdinhchi' && !(r.ngayTDC && r.ngayTDC >= start)) return false;
+      return !(r.ngayKLDT && r.ngayKLDT < start && r.dtbs.every((b) => b.ngayKL && b.ngayKL < start));
+    };
     const P = (fn) => rs.filter(fn); const C = (fn) => cs.filter(fn);
     const bsP = (fn) => P((r) => r.dtbs.some(fn)); const bsC = (fn) => C((x) => x.rs.some((r) => r.dtbs.some(fn)));
-    const d = { rs, cs, Y, rows: [] };
+    // Vụ được tính đình chỉ / tạm đình chỉ trong kỳ khi vụ ghi ngày đó trong kỳ, hoặc mọi bị can của vụ đều đã dừng và có ngày trong kỳ.
+    const stopC = (k, g) => C((x) => inY(x.c[k]) || (!x.c[k] && x.rs.length && x.rs.every((r) => r.giaiDoan === g) && x.rs.some((r) => inY(r[k]))));
+    const d = { rs, cs, Y, start, end, rows: [] };
     const row = (label, c, p, cls = '') => d.rows.push({ label, c: c == null ? '' : c.length, p: p == null ? '' : p.length, cls });
     const dangDT = (g) => g === 'dieutra' || g === 'dtbs';
+    const STAGES = ['dieutra', 'dtbs', 'ketluan', 'truyto', 'xetxu', 'tamdinhchi', 'dinhchi'];
     if (Y) {
       const tonP = P((r) => r.ngayKTBC && r.ngayKTBC < start && openAtStart(r));
-      const tonC = C((x) => x.kt && x.kt < start && !stopped(x.st) && (x.rs.length ? x.rs.some(openAtStart) : !(x.kl && x.kl < start)));
+      const tonC = C((x) => x.kt && x.kt < start && (x.rs.length ? x.rs.some(openAtStart)
+        : !(x.kl && x.kl < start) && !(x.c.ngayDC && x.c.ngayDC < start) && !(x.c.ngayTDC && x.c.ngayTDC < start)));
       const moiP = P((r) => inY(r.ngayKTBC)); const moiC = C((x) => inY(x.kt));
-      row(`Tồn cũ chuyển sang năm ${Y}`, tonC, tonP, 'strong');
-      for (const g of ['dieutra', 'dtbs', 'ketluan', 'truyto', 'xetxu']) {
+      row(`Tồn cũ (khởi tố trước ${vn(start)})`, tonC, tonP, 'strong');
+      for (const g of STAGES) {
         const pc = tonP.filter((r) => r.giaiDoan === g); const cc = tonC.filter((x) => x.st === g);
         if (pc.length || cc.length) row(`hiện ${GIAI_DOAN[g].toLowerCase()}`, cc, pc, 'sub');
       }
-      row(`Khởi tố mới trong năm ${Y}`, moiC, moiP, 'strong');
-      for (const g of ['dieutra', 'dtbs', 'ketluan', 'truyto', 'xetxu', 'tamdinhchi', 'dinhchi']) {
+      row('Khởi tố mới trong kỳ', moiC, moiP, 'strong');
+      for (const g of STAGES) {
         const pc = moiP.filter((r) => r.giaiDoan === g); const cc = moiC.filter((x) => x.st === g);
         if (pc.length || cc.length) row(`hiện ${GIAI_DOAN[g].toLowerCase()}`, cc, pc, 'sub');
       }
-      row('Tổng thụ lý trong năm', [...tonC, ...moiC], [...tonP, ...moiP], 'strong');
-      row('Kết luận điều tra trong năm', C((x) => inY(x.kl) || x.rs.some((r) => inY(r.ngayKLDT))), P((r) => inY(r.ngayKLDT)), 'strong');
+      row('Tổng thụ lý trong kỳ', [...tonC, ...moiC], [...tonP, ...moiP], 'strong');
+      row('Kết luận điều tra trong kỳ', C((x) => inY(x.kl) || x.rs.some((r) => inY(r.ngayKLDT))), P((r) => inY(r.ngayKLDT)), 'strong');
+      row('Tạm đình chỉ trong kỳ', stopC('ngayTDC', 'tamdinhchi'), P((r) => inY(r.ngayTDC)));
+      row('Đình chỉ trong kỳ', stopC('ngayDC', 'dinhchi'), P((r) => inY(r.ngayDC)));
       row('Viện kiểm sát trả điều tra bổ sung', bsC((b) => b.gd !== 'toa' && inY(b.ngayTra)), bsP((b) => b.gd !== 'toa' && inY(b.ngayTra)));
       row('Toà án trả điều tra bổ sung', bsC((b) => b.gd === 'toa' && inY(b.ngayTra)), bsP((b) => b.gd === 'toa' && inY(b.ngayTra)));
-      row('Kết luận điều tra bổ sung trong năm', bsC((b) => inY(b.ngayKL)), bsP((b) => inY(b.ngayKL)));
+      row('Kết luận điều tra bổ sung trong kỳ', bsC((b) => inY(b.ngayKL)), bsP((b) => inY(b.ngayKL)));
     } else {
       row('Tổng số', cs, rs, 'strong');
       row('Đã kết luận điều tra', C((x) => x.kl), P((r) => r.ngayKLDT), 'strong');
+      row('Tạm đình chỉ', C((x) => x.st === 'tamdinhchi'), P((r) => r.giaiDoan === 'tamdinhchi'));
+      row('Đình chỉ', C((x) => x.st === 'dinhchi'), P((r) => r.giaiDoan === 'dinhchi'));
     }
     row('Hiện đang điều tra', C((x) => dangDT(x.st)), P((r) => dangDT(r.giaiDoan)), 'strong');
     row('trong đó điều tra bổ sung', C((x) => x.st === 'dtbs'), P((r) => r.giaiDoan === 'dtbs'), 'sub');
     d.noDateP = P((r) => !r.ngayKTBC).length; d.noDateC = C((x) => !x.kt).length;
+    d.noStopDate = P((r) => (r.giaiDoan === 'dinhchi' && !r.ngayDC) || (r.giaiDoan === 'tamdinhchi' && !r.ngayTDC)).length;
     return d;
   }
   function viewStats() {
     const f = ui.st; const d = statsData();
-    const years = new Set([String(new Date().getFullYear())]);
-    for (const r of records) for (const k of ['ngayKTBC', 'ngayKTVA', 'ngayKLDT']) if (r[k]) years.add(r[k].slice(0, 4));
-    for (const c of cases) for (const k of ['ngayKTVA', 'ngayKLDT']) if (c[k]) years.add(c[k].slice(0, 4));
+    const years = new Set([String(periodOf(today()))]);
+    for (const r of records) for (const k of ['ngayKTBC', 'ngayKTVA', 'ngayKLDT', 'ngayDC', 'ngayTDC']) if (r[k]) years.add(String(periodOf(r[k])));
+    for (const c of cases) for (const k of ['ngayKTVA', 'ngayKLDT', 'ngayDC', 'ngayTDC']) if (c[k]) years.add(String(periodOf(c[k])));
     if (f.nam) years.add(f.nam);
     const opt = (v, t, cur) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''}>${esc(t)}</option>`;
     const values = (k) => (k === 'vuAn' ? cases.map((c) => c.ten) : [...new Set(records.map((r) => r[k]).filter(Boolean))]).sort((a, b) => fold(a).localeCompare(fold(b)));
@@ -526,16 +586,16 @@
     return `${bar('Thống kê')}
     <main class="content">
       <div class="card">
-        <label class="field"><span>Năm</span><select data-st="nam">${opt('', 'Tất cả các năm', f.nam)}${[...years].sort().reverse().map((y) => opt(y, `Năm ${y}`, f.nam)).join('')}</select></label>
+        <label class="field"><span>Năm</span><select data-st="nam">${opt('', 'Tất cả các năm', f.nam)}${[...years].sort().reverse().map((y) => opt(y, fromJan() ? `Năm ${y}` : `Năm ${y} (${vn(periodStart(Number(y)))} – ${vn(addDays(periodStart(Number(y) + 1), -1))})`, f.nam)).join('')}</select></label>
         ${ST_FIELDS.map(([k, t]) => `<label class="field"><span>${t}</span><select data-st="${k}">${opt('', 'Tất cả', f[k])}${values(k).map((v) => opt(v, label(k, v), f[k])).join('')}</select></label>`).join('')}
       </div>
       ${active ? '<button class="btn plain" data-act="clearStats">Bỏ lọc</button>' : ''}
-      <h3 class="section-title">${f.nam ? `Số liệu năm ${f.nam}` : 'Số liệu tất cả các năm'}</h3>
+      <h3 class="section-title">${f.nam ? `Kỳ thống kê năm ${f.nam}: ${vn(d.start)} – ${vn(addDays(d.end, -1))}` : 'Số liệu tất cả các năm'}</h3>
       <div class="card">
         <div class="trow head"><span></span><b>Vụ</b><b>Bị can</b></div>
         ${d.rows.map((r) => `<div class="trow ${r.cls}"><span>${esc(r.label)}</span><b>${r.c}</b><b>${r.p}</b></div>`).join('')}
       </div>
-      <p class="note">Vụ tính theo ngày khởi tố vụ án, bị can tính theo ngày khởi tố bị can. Hồ sơ đình chỉ, tạm đình chỉ không tính vào tồn cũ.${d.noDateP || d.noDateC ? ` Còn ${d.noDateC} vụ và ${d.noDateP} bị can chưa ghi ngày khởi tố nên chưa được tính vào tồn cũ / khởi tố mới.` : ''}</p>
+      <p class="note">Vụ tính theo ngày khởi tố vụ án, bị can tính theo ngày khởi tố bị can. Mốc bắt đầu kỳ thống kê đổi được trong Cài đặt.${d.noDateP || d.noDateC ? ` Còn ${d.noDateC} vụ và ${d.noDateP} bị can chưa ghi ngày khởi tố nên chưa được tính vào tồn cũ / khởi tố mới.` : ''}${d.noStopDate ? ` Có ${d.noStopDate} bị can đình chỉ, tạm đình chỉ chưa ghi ngày quyết định nên không tính vào tồn cũ.` : ''}</p>
       ${group('Bị can theo giai đoạn', (r) => GIAI_DOAN[r.giaiDoan])}
       ${group('Điều tra bổ sung theo lần và cơ quan trả', (r) => (r.giaiDoan === 'dtbs' && r.dtbs.length ? `Lần ${r.dtbs.length} — ${CO_QUAN_TRA[r.dtbs[r.dtbs.length - 1].gd] || CO_QUAN_TRA.vks}` : null))}
       ${group('Bị can theo biện pháp ngăn chặn', (r) => BIEN_PHAP[r.bienPhap])}
@@ -550,6 +610,12 @@
       <h3 class="section-title">Cảnh báo</h3>
       <div class="card"><label class="field"><span>Cảnh báo trước khi hết hạn tạm giữ, tạm giam (ngày)</span>
         <input id="alertDays" type="number" inputmode="numeric" min="1" max="60" value="${settings.alertDays}"></label></div>
+
+      <h3 class="section-title">Kỳ thống kê</h3>
+      <div class="card"><div class="term"><span style="flex:1;color:var(--text);font-size:16px">Kỳ năm bắt đầu từ ngày</span>
+        <input id="statDay" type="number" inputmode="numeric" min="1" max="31" value="${settings.statDay}" data-k="ngay" aria-label="Ngày"><span>/</span>
+        <input id="statMonth" type="number" inputmode="numeric" min="1" max="12" value="${settings.statMonth}" data-k="ngay" aria-label="Tháng"></div></div>
+      <p class="note">Ví dụ 15/11: năm ${periodOf(today())} tính từ ${vn(periodStart(periodOf(today())))} đến ${vn(addDays(periodStart(periodOf(today()) + 1), -1))}; án khởi tố trước ngày ${vn(periodStart(periodOf(today())))} chưa giải quyết xong là tồn cũ.</p>
 
       <h3 class="section-title">Bảng thời hạn (loại → số ngày)</h3>
       <div class="card">
@@ -616,6 +682,7 @@
         kv('Bản kết luận điều tra', so('', r.soKLDT, r.ngayKLDT)),
         ...(r.dtbs || []).map((b, i) => kv(`Điều tra bổ sung lần ${i + 1}`, `${CO_QUAN_TRA[b.gd] || CO_QUAN_TRA.vks}${b.ngayTra ? ' ngày ' + vn(b.ngayTra) : ''}\n${b.ngayKL || b.so ? 'Kết luận bổ sung ' + so('', b.so, b.ngayKL) : 'Chưa kết luận bổ sung'}`)),
       ])}
+      ${block('Tạm đình chỉ, đình chỉ', [kv('Tạm đình chỉ', so('', r.soTDC, r.ngayTDC)), kv('Đình chỉ', so('', r.soDC, r.ngayDC))])}
       ${block('Thụ lý', [kv('Điều tra viên', r.dtv), kv('Kiểm sát viên', r.ksv)])}
       ${block('Ghi chú', [r.ghiChu ? `<div class="pad" style="white-space:pre-wrap">${esc(r.ghiChu)}</div>` : ''])}
       <button class="btn danger" data-act="delete" data-id="${esc(r.id)}">Xoá hồ sơ này</button>
@@ -627,7 +694,7 @@
   function blank() {
     return { id: uid(), hoTen: '', tenKhac: '', gioiTinh: 'Nam', ngaySinh: '', cccd: '', quocTich: 'Việt Nam', danToc: 'Kinh', ngheNghiep: '', hktt: '', choO: '', tienAn: '', anh: '',
       vuAn: '', soQDKTVA: '', ngayKTVA: '', toiDanh: '', dieuKhoan: '', soQDKTBC: '', ngayKTBC: '', giaiDoan: 'dieutra',
-      bienPhap: 'tamgiam', ngayBat: '', noiGiam: '', soLenh: '', loaiHan: '', tgTu: '', tgDen: '', giaHan: [], soKLDT: '', ngayKLDT: '', dtbs: [], dtv: '', ksv: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
+      bienPhap: 'tamgiam', ngayBat: '', noiGiam: '', soLenh: '', loaiHan: '', tgTu: '', tgDen: '', giaHan: [], soKLDT: '', ngayKLDT: '', dtbs: [], soTDC: '', ngayTDC: '', soDC: '', ngayDC: '', dtv: '', ksv: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
   }
   function inp(label, name, v, type = 'text', extra = '') {
     return `<label class="field"><span>${esc(label)}</span><input name="${name}" type="${type}" value="${esc(v)}" autocomplete="off" ${extra}></label>`;
@@ -720,7 +787,14 @@
         </div>`).join('')}
         <button type="button" class="row" data-act="addBs"><div class="main"><div class="name link">+ Thêm lần điều tra bổ sung</div></div></button>
       </div>
-      <p class="note">Khi lưu, giai đoạn tự chuyển sang "Điều tra bổ sung" nếu lần trả hồ sơ gần nhất chưa có ngày kết luận bổ sung, và sang "Đã kết luận điều tra" khi đã có ngày kết luận.</p>
+      <h3 class="section-title">Tạm đình chỉ, đình chỉ</h3>
+      <div class="card">
+        ${inp('Quyết định tạm đình chỉ số', 'soTDC', r.soTDC)}
+        ${inp('Ngày tạm đình chỉ', 'ngayTDC', r.ngayTDC, 'date')}
+        ${inp('Quyết định đình chỉ số', 'soDC', r.soDC)}
+        ${inp('Ngày đình chỉ', 'ngayDC', r.ngayDC, 'date')}
+      </div>
+      <p class="note">Khi lưu, giai đoạn tự chuyển theo các ngày vừa ghi: điều tra bổ sung (lần trả hồ sơ gần nhất chưa kết luận bổ sung), đã kết luận điều tra, tạm đình chỉ, đình chỉ. Khi phục hồi điều tra, chọn lại giai đoạn "Đang điều tra".</p>
       <h3 class="section-title">Thụ lý & ghi chú</h3>
       <div class="card">
         ${inp('Điều tra viên thụ lý', 'dtv', r.dtv, 'text', 'autocapitalize="words"')}
@@ -758,7 +832,7 @@
   const FIELD_NAMES = { hoTen: 'Họ tên', tenKhac: 'Tên gọi khác', gioiTinh: 'Giới tính', ngaySinh: 'Ngày sinh', cccd: 'CCCD', quocTich: 'Quốc tịch', danToc: 'Dân tộc',
     ngheNghiep: 'Nghề nghiệp', hktt: 'Nơi thường trú', choO: 'Chỗ ở', tienAn: 'Tiền án, tiền sự', vuAn: 'Vụ án', soQDKTVA: 'Số QĐ khởi tố vụ án', ngayKTVA: 'Ngày khởi tố vụ án',
     toiDanh: 'Tội danh', dieuKhoan: 'Điều khoản', soQDKTBC: 'Số QĐ khởi tố bị can', ngayKTBC: 'Ngày khởi tố bị can', bienPhap: 'Biện pháp ngăn chặn', ngayBat: 'Ngày bắt',
-    noiGiam: 'Nơi giam giữ', soLenh: 'Số lệnh', tgTu: 'Từ ngày', tgDen: 'Đến ngày', giaHan: 'Gia hạn', soKLDT: 'Số kết luận điều tra', ngayKLDT: 'Ngày kết luận điều tra', dtbs: 'Kết luận điều tra bổ sung', dtv: 'Điều tra viên', ksv: 'Kiểm sát viên' };
+    noiGiam: 'Nơi giam giữ', soLenh: 'Số lệnh', tgTu: 'Từ ngày', tgDen: 'Đến ngày', giaHan: 'Gia hạn', soKLDT: 'Số kết luận điều tra', ngayKLDT: 'Ngày kết luận điều tra', dtbs: 'Kết luận điều tra bổ sung', soTDC: 'Số QĐ tạm đình chỉ', ngayTDC: 'Ngày tạm đình chỉ', soDC: 'Số QĐ đình chỉ', ngayDC: 'Ngày đình chỉ', dtv: 'Điều tra viên', ksv: 'Kiểm sát viên' };
   const ALWAYS_SET = ['bienPhap', 'gioiTinh', 'quocTich', 'danToc'];
   // Điền kết quả quét vào hồ sơ: không ghi đè ô người dùng đã nhập. Trả về tên các mục đã điền.
   function applyScan(r, got) {
@@ -778,7 +852,8 @@
     return filled;
   }
   const CASE_FIELDS = { ten: ['vuAn', 'Tên vụ án'], soQDKTVA: ['soQDKTVA', 'Số QĐ khởi tố vụ án'], ngayKTVA: ['ngayKTVA', 'Ngày khởi tố vụ án'], toiDanh: ['toiDanh', 'Tội danh'],
-    dieuKhoan: ['dieuKhoan', 'Điều khoản'], dtv: ['dtv', 'Điều tra viên'], soKLDT: ['soKLDT', 'Số kết luận điều tra'], ngayKLDT: ['ngayKLDT', 'Ngày kết luận điều tra'] };
+    dieuKhoan: ['dieuKhoan', 'Điều khoản'], dtv: ['dtv', 'Điều tra viên'], soKLDT: ['soKLDT', 'Số kết luận điều tra'], ngayKLDT: ['ngayKLDT', 'Ngày kết luận điều tra'],
+    soTDC: ['soTDC', 'Số QĐ tạm đình chỉ'], ngayTDC: ['ngayTDC', 'Ngày tạm đình chỉ'], soDC: ['soDC', 'Số QĐ đình chỉ'], ngayDC: ['ngayDC', 'Ngày đình chỉ'] };
   function applyCaseScan(c, got) {
     const filled = [];
     for (const [k, [from, label]] of Object.entries(CASE_FIELDS)) if (!c[k] && got[from]) { c[k] = got[from]; filled.push(label); }
@@ -807,7 +882,7 @@
       if (inCaseForm) syncCaseDraft();
       else {
         const ex = (got.soQDKTVA && cases.find((c) => c.soQDKTVA === got.soQDKTVA)) || caseByName(got.vuAn);
-        existed = !!ex; ui.cdraft = ex ? clone(ex) : blankCase(); ui.page = { type: 'caseForm', from: ui.page };
+        existed = !!ex; ui.cdraft = ex ? normCase(clone(ex)) : blankCase(); ui.page = { type: 'caseForm', from: ui.page };
       }
       ui.scan = { filled: applyCaseScan(ui.cdraft, got), text: res.text, existed };
       render(); done(ui.scan.filled.length); return;
@@ -938,7 +1013,7 @@
       await putRecord(r); if (old) updated++; else added++;
     }
     for (const row of data.cases || []) {
-      const c = await unseal(k, { iv: unb64(row.iv), ct: unb64(row.ct) });
+      const c = normCase(await unseal(k, { iv: unb64(row.iv), ct: unb64(row.ct) }));
       const old = cases.find((x) => x.id === c.id) || caseByName(c.ten);
       if (!old) { await putCase(c); continue; }
       // Vụ án đã có: giữ bản đang có, chỉ lấy thêm các ô còn trống.
@@ -961,6 +1036,7 @@
       ['Gia hạn', (r) => (r.giaHan || []).map((g, i) => `Lần ${i + 1}: ${g.so || ''} ${g.loai || ''} ${vn(g.tu)}-${vn(g.den)}`).join('; ')],
       ['Hạn hiện tại', (r) => vn(deadlineOf(r))], ['KLĐT số', (r) => r.soKLDT], ['Ngày KLĐT', (r) => vn(r.ngayKLDT)],
       ['Điều tra bổ sung', (r) => (r.dtbs || []).map((b, i) => `Lần ${i + 1}: ${CO_QUAN_TRA[b.gd] || CO_QUAN_TRA.vks} ${vn(b.ngayTra)}; KL bổ sung ${b.so || ''} ${vn(b.ngayKL)}`).join(' | ')],
+      ['QĐ tạm đình chỉ số', (r) => r.soTDC], ['Ngày tạm đình chỉ', (r) => vn(r.ngayTDC)], ['QĐ đình chỉ số', (r) => r.soDC], ['Ngày đình chỉ', (r) => vn(r.ngayDC)],
       ['Điều tra viên', (r) => r.dtv], ['Kiểm sát viên', (r) => r.ksv], ['Ghi chú', (r) => r.ghiChu],
     ];
     // Thêm dấu ' trước ô bắt đầu bằng = + - @ để Excel không coi là công thức; CCCD giữ dạng chữ.
@@ -987,7 +1063,7 @@
     newCase() { ui.scan = null; ui.cdraft = blankCase(); ui.page = { type: 'caseForm', from: ui.page }; render(); },
     editCase(el) {
       const c = cases.find((x) => x.id === el.dataset.id); if (!c) return;
-      ui.scan = null; ui.cdraft = clone(c); ui.page = { type: 'caseForm', from: ui.page }; render();
+      ui.scan = null; ui.cdraft = normCase(clone(c)); ui.page = { type: 'caseForm', from: ui.page }; render();
     },
     async saveCase() {
       syncCaseDraft(); const c = ui.cdraft;
@@ -1002,7 +1078,11 @@
         const before = JSON.stringify(r);
         r.vuAn = c.ten;
         for (const k of ['soQDKTVA', 'ngayKTVA']) if (c[k]) r[k] = c[k];
-        if (c.ngayKLDT && !r.ngayKLDT) { r.ngayKLDT = c.ngayKLDT; if (!r.soKLDT) r.soKLDT = c.soKLDT; autoStage(r); }
+        const was = clone(r);
+        if (c.ngayKLDT && !r.ngayKLDT) { r.ngayKLDT = c.ngayKLDT; if (!r.soKLDT) r.soKLDT = c.soKLDT; }
+        if (c.ngayTDC && !r.ngayTDC) { r.ngayTDC = c.ngayTDC; if (!r.soTDC) r.soTDC = c.soTDC; }
+        if (c.ngayDC && !r.ngayDC) { r.ngayDC = c.ngayDC; if (!r.soDC) r.soDC = c.soDC; }
+        stageFromStop(r, was); autoStage(r);
         if (JSON.stringify(r) !== before) { r.updatedAt = Date.now(); await putRecord(r); }
       }
       ui.cdraft = null; ui.scan = null; ui.tab = 'cases';
@@ -1040,7 +1120,7 @@
       for (const p of list) {
         const ex = findExisting(p.got);
         const r = ex ? normalize(clone(ex)) : blank();
-        applyScan(r, p.got); linkCase(r); autoStage(r); r.updatedAt = Date.now();
+        applyScan(r, p.got); linkCase(r); stageFromStop(r, ex); autoStage(r); r.updatedAt = Date.now();
         await putRecord(r); await ensureCase(r.vuAn, r);
         if (ex) merged++; else added++;
       }
@@ -1056,7 +1136,7 @@
       const isNew = !records.some((x) => x.id === r.id);
       const dup = isNew && findExisting(r);
       if (dup && !confirm(`Đã có hồ sơ của "${dup.hoTen}"${dup.ngaySinh ? ' sinh ' + vn(dup.ngaySinh) : ''}. Vẫn lưu thành một hồ sơ mới?`)) return;
-      linkCase(r); autoStage(r);
+      linkCase(r); stageFromStop(r, records.find((x) => x.id === r.id)); autoStage(r);
       r.updatedAt = Date.now();
       await putRecord(r); await ensureCase(r.vuAn, r);
       ui.draft = null; ui.scan = null;
@@ -1124,6 +1204,11 @@
       if (t.id === 'alertDays') {
         settings.alertDays = Math.min(60, Math.max(1, parseInt(t.value, 10) || 10));
         await metaSet('settings', settings); render(true); toast('Đã lưu cài đặt');
+      } else if (t.id === 'statDay' || t.id === 'statMonth') {
+        const m = Math.min(12, Math.max(1, parseInt($('#statMonth').value, 10) || 1));
+        const dmax = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1];
+        settings.statMonth = m; settings.statDay = Math.min(dmax, Math.max(1, parseInt($('#statDay').value, 10) || 1));
+        await metaSet('settings', settings); ui.st.nam = String(periodOf(today())); render(true); toast('Đã lưu cài đặt');
       } else if (t.dataset.st) {
         ui.st[t.dataset.st] = t.value; render(true);
       } else if (t.name === 'vuAn' && ui.draft) {
@@ -1212,6 +1297,7 @@
       auth = (await metaGet('auth')) || null;
       settings = Object.assign(settings, (await metaGet('settings')) || {});
       if (!Array.isArray(settings.terms)) settings.terms = defaultSettings().terms;
+      ui.st.nam = String(periodOf(today()));
     } catch (err) {
       app.innerHTML = `<div class="lock"><p class="warn">Không mở được bộ nhớ của trình duyệt (${esc(err && err.message)}). Hãy tắt chế độ duyệt riêng tư rồi thử lại.</p></div>`;
       return;
