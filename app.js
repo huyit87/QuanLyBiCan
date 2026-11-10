@@ -18,11 +18,13 @@
   const GIAI_DOAN = {
     dieutra: 'Đang điều tra',
     ketluan: 'Đã kết luận điều tra',
+    dtbs: 'Điều tra bổ sung',
     truyto: 'Truy tố',
     xetxu: 'Xét xử',
     tamdinhchi: 'Tạm đình chỉ',
     dinhchi: 'Đình chỉ',
   };
+  const CO_QUAN_TRA = { vks: 'Viện kiểm sát trả', toa: 'Toà án trả' };
   const GIAM_GIU = ['tamgiam', 'tamgiu'];
   const TAI_NGOAI = ['camdi', 'baolinh', 'dattien'];
   // Bảng tra số ngày theo loại thời hạn (sửa được trong Cài đặt).
@@ -35,7 +37,7 @@
     { ten: '4 tháng', ngay: 120 },
   ];
   const defaultSettings = () => ({ alertDays: 10, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
-  const APP_VERSION = '5'; // tăng cùng lúc với VERSION trong sw.js
+  const APP_VERSION = '6'; // tăng cùng lúc với VERSION trong sw.js
   const PBKDF2_ITER = 310000;
   const AUTO_LOCK_MS = 60 * 1000;
 
@@ -77,10 +79,12 @@
   let db;
   function openDB() {
     return new Promise((res, rej) => {
-      const r = indexedDB.open('qlbc', 1);
+      const r = indexedDB.open('qlbc', 2);
       r.onupgradeneeded = () => {
-        r.result.createObjectStore('meta');
-        r.result.createObjectStore('bican', { keyPath: 'id' });
+        const d = r.result; const has = (n) => d.objectStoreNames.contains(n);
+        if (!has('meta')) d.createObjectStore('meta');
+        if (!has('bican')) d.createObjectStore('bican', { keyPath: 'id' });
+        if (!has('vuan')) d.createObjectStore('vuan', { keyPath: 'id' });   // vụ án (từ phiên bản 6)
       };
       r.onsuccess = () => res(r.result);
       r.onerror = () => rej(r.error);
@@ -127,13 +131,33 @@
   let auth = null;           // { salt, iter, check }
   let records = [];          // hồ sơ đã giải mã
   let settings = defaultSettings();
-  const ui = { tab: 'home', page: null, q: '', filter: 'all', draft: null, lockErr: '', scan: null };
+  let cases = [];            // vụ án đã giải mã
+  const ui = { tab: 'home', page: null, q: '', filter: 'all', draft: null, cdraft: null, lockErr: '', scan: null,
+    st: { nam: String(new Date().getFullYear()), vuAn: '', dtv: '', ksv: '', toiDanh: '', bienPhap: '', giaiDoan: '' } };
 
   async function loadRecords() {
     const rows = await tx('bican', 'readonly', (s) => s.getAll());
     const out = [];
-    for (const row of rows) out.push(await unseal(key, row));
+    for (const row of rows) out.push(normalize(await unseal(key, row)));
     records = out;
+    const crows = await tx('vuan', 'readonly', (s) => s.getAll());
+    const cs = [];
+    for (const row of crows) cs.push(await unseal(key, row));
+    cases = cs;
+    await syncCases();
+  }
+  // Bổ sung các trường mới cho hồ sơ tạo từ phiên bản cũ.
+  function normalize(r) {
+    r.giaHan = r.giaHan || []; r.dtbs = r.dtbs || [];
+    r.loaiHan = r.loaiHan || ''; r.soKLDT = r.soKLDT || ''; r.ngayKLDT = r.ngayKLDT || '';
+    return r;
+  }
+  // Tự đặt giai đoạn theo kết luận điều tra / điều tra bổ sung (không đụng tới đình chỉ, tạm đình chỉ).
+  function autoStage(r) {
+    if (['dinhchi', 'tamdinhchi'].includes(r.giaiDoan)) return;
+    const last = r.dtbs[r.dtbs.length - 1];
+    if (last && !last.ngayKL) r.giaiDoan = 'dtbs';
+    else if (['dieutra', 'dtbs'].includes(r.giaiDoan) && (r.ngayKLDT || last)) r.giaiDoan = 'ketluan';
   }
   async function putRecord(r) {
     const box = await seal(key, r);
@@ -144,6 +168,87 @@
   async function removeRecord(id) {
     await tx('bican', 'readwrite', (s) => s.delete(id));
     records = records.filter((x) => x.id !== id);
+  }
+
+  // ---------- Vụ án ----------
+  const normName = (v) => fold(String(v || '')).replace(/\s+/g, ' ').trim();
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  async function putCase(c) {
+    const box = await seal(key, c);
+    await tx('vuan', 'readwrite', (s) => s.put({ id: c.id, iv: box.iv, ct: box.ct }));
+    const i = cases.findIndex((x) => x.id === c.id);
+    if (i >= 0) cases[i] = c; else cases.push(c);
+  }
+  async function removeCase(id) {
+    await tx('vuan', 'readwrite', (s) => s.delete(id));
+    cases = cases.filter((x) => x.id !== id);
+  }
+  const caseByName = (name) => { const k = normName(name); return k ? cases.find((c) => normName(c.ten) === k) : undefined; };
+  function blankCase(ten = '') {
+    return { id: uid(), ten, soQDKTVA: '', ngayKTVA: '', toiDanh: '', dieuKhoan: '', dtv: '', soKLDT: '', ngayKLDT: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
+  }
+  const CASE_SEED = ['soQDKTVA', 'ngayKTVA', 'toiDanh', 'dieuKhoan', 'dtv'];
+  // Bảo đảm tên vụ án ghi trong hồ sơ bị can luôn có trong danh sách vụ án.
+  async function ensureCase(name, seed = {}) {
+    name = String(name || '').trim(); if (!name) return null;
+    let c = caseByName(name); let changed = false;
+    if (!c) { c = blankCase(name); changed = true; }
+    for (const k of CASE_SEED) if (!c[k] && seed[k]) { c[k] = seed[k]; changed = true; }
+    if (changed) { c.updatedAt = Date.now(); await putCase(c); }
+    return c;
+  }
+  async function syncCases() { for (const r of records) if (normName(r.vuAn) && !caseByName(r.vuAn)) await ensureCase(r.vuAn, r); }
+  // Gắn bị can vào vụ án đã có: theo tên, hoặc theo số quyết định khởi tố vụ án.
+  function linkCase(r) {
+    let c = caseByName(r.vuAn);
+    if (!c && !normName(r.vuAn) && r.soQDKTVA) c = cases.find((x) => x.soQDKTVA && x.soQDKTVA === r.soQDKTVA);
+    if (!c) return;
+    r.vuAn = c.ten;
+    for (const k of ['soQDKTVA', 'ngayKTVA']) if (!r[k] && c[k]) r[k] = c[k];
+  }
+  const casePeople = (c) => records.filter((r) => normName(r.vuAn) === normName(c.ten));
+  function caseStatus(c, rs) {
+    const any = (...g) => rs.some((r) => g.includes(r.giaiDoan));
+    if (any('dtbs')) return 'dtbs';
+    if (any('dieutra') || (!rs.length && !c.ngayKLDT)) return 'dieutra';
+    if (any('ketluan', 'truyto', 'xetxu') || c.ngayKLDT) return 'ketluan';
+    if (any('tamdinhchi')) return 'tamdinhchi';
+    return 'dinhchi';
+  }
+
+  // ---------- Hồ sơ trùng ----------
+  // Hai hồ sơ là một người nếu trùng CCCD; hoặc trùng họ tên và ngày sinh;
+  // hoặc trùng họ tên, thiếu ngày sinh, và không thuộc hai vụ án khác nhau.
+  function samePerson(a, b) {
+    if (a.cccd && b.cccd) return a.cccd === b.cccd;
+    const na = normName(a.hoTen); if (!na || na.startsWith('(') || na !== normName(b.hoTen)) return false;
+    if (a.ngaySinh && b.ngaySinh) return a.ngaySinh === b.ngaySinh;
+    return !normName(a.vuAn) || !normName(b.vuAn) || normName(a.vuAn) === normName(b.vuAn);
+  }
+  const findExisting = (got, exceptId) => records.find((r) => r.id !== exceptId && samePerson(r, got));
+  function dupGroups() {
+    const used = new Set(); const out = [];
+    records.forEach((r, i) => {
+      if (used.has(r.id)) return;
+      const g = [r];
+      for (let j = i + 1; j < records.length; j++) if (!used.has(records[j].id) && g.some((x) => samePerson(x, records[j]))) { g.push(records[j]); used.add(records[j].id); }
+      if (g.length > 1) { used.add(r.id); out.push(g); }
+    });
+    return out;
+  }
+  function mergeGroup(g) {
+    const filled = (r) => Object.values(r).filter((v) => (Array.isArray(v) ? v.length : v)).length;
+    const sorted = [...g].sort((a, b) => filled(b) - filled(a));
+    const base = clone(sorted[0]);
+    for (const o of sorted.slice(1)) {
+      for (const [k, v] of Object.entries(o)) {
+        if (Array.isArray(v)) { base[k] = base[k] || []; for (const it of v) if (!base[k].some((x) => JSON.stringify(x) === JSON.stringify(it))) base[k].push(it); }
+        else if (!base[k] && v) base[k] = v;
+      }
+      base.createdAt = Math.min(base.createdAt || Date.now(), o.createdAt || Date.now());
+    }
+    base.updatedAt = Date.now(); autoStage(base);
+    return base;
   }
 
   // ---------- Nghiệp vụ: thời hạn tạm giữ / tạm giam ----------
@@ -182,6 +287,7 @@
     home: '<svg viewBox="0 0 24 24"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>',
     list: '<svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.6-3.6 3.2-5.5 6.5-5.5s5.900 1.900 6.500 5.500"/><path d="M16 5.500a3 3 0 010 5.500M18.500 15c1.700.800 2.700 2.500 3 5"/></svg>',
     cases: '<svg viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v10H3z"/></svg>',
+    stats: '<svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
     settings: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.900 4.900l2.100 2.100M17 17l2.100 2.100M4.900 19.100L7 17M17 7l2.100-2.100"/></svg>',
   };
   function bar(title, left = '', right = '') {
@@ -190,7 +296,7 @@
   function tabs() {
     const n = alerts().length;
     const t = (id, label) => `<button data-act="tab" data-tab="${id}" class="${ui.tab === id ? 'on' : ''}">${ICON[id]}${label}${id === 'home' && n ? `<span class="dot">${n}</span>` : ''}</button>`;
-    return `<nav class="tabs">${t('home', 'Tổng quan')}${t('list', 'Bị can')}${t('cases', 'Vụ án')}${t('settings', 'Cài đặt')}</nav>`;
+    return `<nav class="tabs">${t('home', 'Tổng quan')}${t('list', 'Bị can')}${t('cases', 'Vụ án')}${t('stats', 'Thống kê')}${t('settings', 'Cài đặt')}</nav>`;
   }
   function avatar(r, big) {
     return r.anh
@@ -200,7 +306,10 @@
   function personRow(r, withDeadline) {
     const d = dlInfo(r);
     const sub = [r.toiDanh, r.vuAn].filter(Boolean).join(' · ') || (r.ngaySinh ? `Sinh ${vn(r.ngaySinh)}` : '');
-    const right = withDeadline && d
+    const bs = r.dtbs && r.dtbs[r.dtbs.length - 1];
+    const right = withDeadline === 'dtbs' && bs
+      ? `<span class="tag orange">Lần ${r.dtbs.length}</span><div class="sub">${bs.gd === 'toa' ? 'Toà án trả' : 'VKS trả'}${bs.ngayTra ? ' ' + vn(bs.ngayTra) : ''}</div>`
+      : withDeadline && d
       ? `<span class="tag ${d.level}">${esc(d.text)}</span><div class="sub">${vn(d.date)}</div>`
       : `${bpTag(r)}${d && d.level !== 'green' ? `<div class="sub"><span class="tag ${d.level}">${esc(d.text)}</span></div>` : ''}`;
     return `<button class="row" data-act="open" data-id="${esc(r.id)}">${avatar(r)}<div class="main"><div class="name">${esc(r.hoTen)}</div><div class="sub">${esc(sub)}</div></div><div class="right">${right}</div></button>`;
@@ -211,6 +320,10 @@
     const giam = records.filter((r) => GIAM_GIU.includes(r.bienPhap) && r.giaiDoan !== 'dinhchi');
     const ngoai = records.filter((r) => TAI_NGOAI.includes(r.bienPhap));
     const truyna = records.filter((r) => r.bienPhap === 'truyna');
+    const kl = records.filter((r) => ['ketluan', 'truyto', 'xetxu'].includes(r.giaiDoan));
+    const bs = records.filter((r) => r.giaiDoan === 'dtbs');
+    const bsVks = bs.filter((r) => (r.dtbs[r.dtbs.length - 1] || {}).gd !== 'toa').length;
+    const bsLan = {}; bs.forEach((r) => { const l = r.dtbs.length || 1; bsLan[l] = (bsLan[l] || 0) + 1; });
     const al = alerts();
     const upcoming = records.map((r) => ({ r, d: dlInfo(r) })).filter((x) => x.d && x.d.level === 'green').sort((a, b) => a.d.left - b.d.left);
     return `${bar('Quản lý bị can', '', '<button data-act="lock">Khoá</button>')}
@@ -220,7 +333,11 @@
         <button class="stat" data-act="goFilter" data-filter="giam"><b>${giam.length}</b><span>Đang tạm giữ, tạm giam</span></button>
         <button class="stat" data-act="goFilter" data-filter="ngoai"><b>${ngoai.length}</b><span>Tại ngoại</span></button>
         <button class="stat ${truyna.length ? 'red' : ''}" data-act="goFilter" data-filter="truyna"><b>${truyna.length}</b><span>Đang truy nã</span></button>
+        <button class="stat" data-act="goFilter" data-filter="xong"><b>${kl.length}</b><span>Đã kết luận điều tra</span></button>
+        <button class="stat ${bs.length ? 'orange' : ''}" data-act="goFilter" data-filter="dtbs"><b>${bs.length}</b><span>Điều tra bổ sung${bs.length ? ` (VKS trả ${bsVks}, Toà trả ${bs.length - bsVks})` : ''}</span></button>
       </div>
+      ${bs.length ? `<h3 class="section-title">Đang điều tra bổ sung (${bs.length}) — ${Object.entries(bsLan).map(([l, n]) => `lần ${l}: ${n}`).join(', ')}</h3>
+      <div class="card">${bs.map((r) => personRow(r, 'dtbs')).join('')}</div>` : ''}
       <h3 class="section-title">Hạn tạm giữ, tạm giam cần chú ý (${al.length})</h3>
       <div class="card">${al.length ? al.map((x) => personRow(x.r, true)).join('') : `<div class="empty">Không có hạn nào quá hạn hoặc sắp hết trong ${settings.alertDays} ngày tới.</div>`}</div>
       ${upcoming.length ? `<h3 class="section-title">Các hạn tiếp theo</h3><div class="card">${upcoming.map((x) => personRow(x.r, true)).join('')}</div>` : ''}
@@ -236,7 +353,8 @@
     ['ngoai', 'Tại ngoại', (r) => TAI_NGOAI.includes(r.bienPhap)],
     ['truyna', 'Truy nã', (r) => r.bienPhap === 'truyna'],
     ['dieutra', 'Đang điều tra', (r) => r.giaiDoan === 'dieutra'],
-    ['xong', 'Đã kết thúc điều tra', (r) => ['ketluan', 'truyto', 'xetxu'].includes(r.giaiDoan)],
+    ['xong', 'Đã kết luận điều tra', (r) => ['ketluan', 'truyto', 'xetxu'].includes(r.giaiDoan)],
+    ['dtbs', 'Điều tra bổ sung', (r) => r.giaiDoan === 'dtbs'],
     ['dinhchi', 'Đình chỉ, tạm đình chỉ', (r) => ['dinhchi', 'tamdinhchi'].includes(r.giaiDoan)],
   ];
   function listHtml() {
@@ -247,40 +365,182 @@
     return `<div class="card">${rows.map((r) => personRow(r)).join('')}</div><p class="note">${rows.length} bị can</p>`;
   }
   function viewList() {
+    const dups = dupGroups();
     return `${bar('Danh sách bị can')}
     <main class="content">
       <input class="search" id="q" type="search" placeholder="Tìm tên, CCCD, vụ án, tội danh…" value="${esc(ui.q)}" autocomplete="off">
       <div class="chips">${FILTERS.map(([id, label]) => `<button class="chip ${ui.filter === id ? 'on' : ''}" data-act="filter" data-filter="${id}">${label}</button>`).join('')}</div>
+      ${dups.length ? `<div class="card pad scan-note" style="margin-bottom:10px"><b>Có ${dups.length} bị can bị nhập trùng (${dups.reduce((n, g) => n + g.length, 0)} hồ sơ).</b>
+        <p>${esc(dups.slice(0, 5).map((g) => g[0].hoTen).join(', '))}${dups.length > 5 ? '…' : ''}</p>
+        <button class="link" data-act="mergeDups" style="margin-top:6px;font-weight:600">Gộp các hồ sơ trùng</button></div>` : ''}
       <div id="list">${listHtml()}</div>
     </main>
     <button class="fab" data-act="new" aria-label="Thêm bị can">+</button>`;
   }
 
-  const caseName = (r) => (r.vuAn || '').trim() || 'Chưa gắn vụ án';
-  function caseGroups() {
-    const m = new Map();
-    for (const r of records) { const k = caseName(r); if (!m.has(k)) m.set(k, []); m.get(k).push(r); }
-    return [...m.entries()].sort((a, b) => fold(a[0]).localeCompare(fold(b[0])));
-  }
+  const so = (num, date) => [num ? `số ${num}` : '', date ? `ngày ${vn(date)}` : ''].filter(Boolean).join(', ');
+  const SCAN_INPUT = '<input id="scanFile" type="file" accept="image/*,application/pdf,.pdf" multiple hidden>';
   function viewCases() {
-    const groups = caseGroups();
+    const list = [...cases].sort((a, b) => fold(a.ten).localeCompare(fold(b.ten)));
+    const loose = records.filter((r) => !normName(r.vuAn));
     return `${bar('Vụ án')}
     <main class="content">
-      ${groups.length ? `<div class="card">${groups.map(([name, rs]) => {
-        const giam = rs.filter((r) => GIAM_GIU.includes(r.bienPhap)).length;
-        return `<button class="row" data-act="case" data-name="${esc(name)}"><div class="main"><div class="name">${esc(name)}</div><div class="sub">${rs.length} bị can${giam ? ` · ${giam} đang giam giữ` : ''}</div></div><span class="chev">›</span></button>`;
-      }).join('')}</div>` : '<div class="empty">Chưa có vụ án nào. Vụ án được tạo tự động theo tên vụ án ghi trong hồ sơ bị can.</div>'}
+      <button class="btn" style="margin-top:0" data-act="newScan">Thêm vụ án từ văn bản (QĐ khởi tố vụ án)</button>
+      <button class="btn plain" data-act="newCase">Thêm vụ án nhập tay</button>
+      ${SCAN_INPUT}
+      <h3 class="section-title">${list.length} vụ án</h3>
+      ${list.length || loose.length ? `<div class="card">${list.map((c) => {
+        const rs = casePeople(c); const st = caseStatus(c, rs);
+        return `<button class="row" data-act="case" data-name="${esc(c.ten)}"><div class="main"><div class="name" style="white-space:normal">${esc(c.ten)}</div>
+          <div class="sub">${esc([so(c.soQDKTVA, c.ngayKTVA) ? 'QĐ ' + so(c.soQDKTVA, c.ngayKTVA) : '', `${rs.length} bị can`].filter(Boolean).join(' · '))}</div></div>
+          <div class="right"><span class="tag ${st === 'dtbs' ? 'orange' : st === 'dieutra' ? 'blue' : st === 'ketluan' ? 'green' : ''}">${esc(GIAI_DOAN[st])}</span></div></button>`;
+      }).join('')}${loose.length ? `<button class="row" data-act="case" data-name=""><div class="main"><div class="name">Chưa gắn vụ án</div><div class="sub">${loose.length} bị can</div></div><span class="chev">›</span></button>` : ''}</div>`
+      : '<div class="empty">Chưa có vụ án nào.</div>'}
     </main>`;
   }
   function viewCase(name) {
-    const rs = records.filter((r) => caseName(r) === name).sort(byName);
-    const first = rs.find((r) => r.soQDKTVA || r.ngayKTVA) || {};
-    return `${bar('Vụ án', '<button data-act="back">‹ Quay lại</button>')}
-    <main class="content">
-      <div class="card pad"><h2 style="font-size:18px">${esc(name)}</h2>
-      ${first.soQDKTVA || first.ngayKTVA ? `<p class="sub" style="color:var(--muted);margin-top:4px">QĐ khởi tố vụ án ${first.soQDKTVA ? 'số ' + esc(first.soQDKTVA) : ''} ${first.ngayKTVA ? 'ngày ' + vn(first.ngayKTVA) : ''}</p>` : ''}</div>
+    const c = caseByName(name);
+    const rs = (c ? casePeople(c) : records.filter((r) => !normName(r.vuAn))).sort(byName);
+    if (!c) {
+      return `${bar('Chưa gắn vụ án', '<button data-act="back">‹ Quay lại</button>')}
+      <main class="content nopad-bottom"><p class="note" style="margin-bottom:8px">Mở từng hồ sơ, bấm Sửa và chọn tên vụ án để gắn bị can vào vụ.</p>
+      <div class="card">${rs.map((r) => personRow(r)).join('') || '<div class="empty">Không có bị can nào.</div>'}</div></main>`;
+    }
+    return `${bar('Vụ án', '<button data-act="back">‹ Quay lại</button>', `<button class="strong" data-act="editCase" data-id="${esc(c.id)}">Sửa</button>`)}
+    <main class="content nopad-bottom">
+      <div class="card pad"><h2 style="font-size:18px">${esc(c.ten)}</h2><div style="margin-top:6px"><span class="tag">${esc(GIAI_DOAN[caseStatus(c, rs)])}</span></div></div>
+      ${block('Thông tin vụ án', [kv('QĐ khởi tố vụ án', so(c.soQDKTVA, c.ngayKTVA)), kv('Tội danh', c.toiDanh), kv('Điều khoản BLHS', c.dieuKhoan),
+        kv('Điều tra viên', c.dtv), kv('Kết luận điều tra', so(c.soKLDT, c.ngayKLDT)), kv('Ghi chú', c.ghiChu)])}
       <h3 class="section-title">Bị can (${rs.length})</h3>
-      <div class="card">${rs.map((r) => personRow(r)).join('') || '<div class="empty">Không còn bị can nào.</div>'}</div>
+      <div class="card">${rs.map((r) => personRow(r)).join('') || '<div class="empty">Chưa có bị can nào trong vụ này.</div>'}</div>
+      <button class="btn" data-act="new">Thêm bị can vào vụ này</button>
+      ${rs.length ? '' : `<button class="btn danger" data-act="delCase" data-id="${esc(c.id)}">Xoá vụ án</button>`}
+    </main>`;
+  }
+  function scanNote(what) {
+    if (!ui.scan) return '';
+    return `<div class="card pad scan-note" style="margin-top:10px"><b>Đã tự điền ${ui.scan.filled.length} mục từ văn bản — hãy kiểm tra lại từng mục trước khi lưu.</b>
+      ${ui.scan.existed ? `<p>${esc(what)} này đã có trong app — thông tin mới được bổ sung vào hồ sơ cũ, không tạo hồ sơ trùng.</p>` : ''}
+      ${ui.scan.filled.length ? `<p>${esc(ui.scan.filled.join(', '))}</p>` : '<p>Không dò được thông tin mới. Thử ảnh rõ hơn, chụp thẳng, đủ sáng.</p>'}
+      <details><summary>Xem chữ đọc được</summary><pre>${esc(ui.scan.text)}</pre></details></div>`;
+  }
+  function viewCaseForm() {
+    const c = ui.cdraft; const isNew = !cases.some((x) => x.id === c.id);
+    return `${bar(isNew ? 'Thêm vụ án' : 'Sửa vụ án', '<button data-act="cancel">Huỷ</button>', '<button class="strong" data-act="saveCase">Lưu</button>')}
+    <main class="content nopad-bottom"><form id="cform" autocomplete="off">
+      <div class="card">
+        <button type="button" class="row" data-act="pickScan"><div class="main"><div class="name link">Quét quyết định khởi tố vụ án (ảnh, PDF)</div><div class="sub">Tự điền tên vụ án, số và ngày quyết định</div></div></button>
+        ${SCAN_INPUT}
+      </div>
+      ${scanNote('Vụ án')}
+      <h3 class="section-title">Vụ án</h3>
+      <div class="card">
+        ${area('Tên vụ án *', 'ten', c.ten)}
+        ${inp('QĐ khởi tố vụ án số', 'soQDKTVA', c.soQDKTVA)}
+        ${inp('Ngày khởi tố vụ án', 'ngayKTVA', c.ngayKTVA, 'date')}
+        ${inp('Tội danh', 'toiDanh', c.toiDanh)}
+        ${inp('Điều, khoản BLHS', 'dieuKhoan', c.dieuKhoan)}
+        ${inp('Điều tra viên thụ lý', 'dtv', c.dtv, 'text', 'autocapitalize="words"')}
+      </div>
+      <h3 class="section-title">Kết luận điều tra vụ án</h3>
+      <div class="card">
+        ${inp('Bản kết luận điều tra số', 'soKLDT', c.soKLDT)}
+        ${inp('Ngày kết luận điều tra', 'ngayKLDT', c.ngayKLDT, 'date')}
+      </div>
+      <p class="note">Khi lưu, ngày kết luận điều tra của vụ án được điền cho các bị can trong vụ chưa có ngày kết luận.</p>
+      <h3 class="section-title">Ghi chú</h3>
+      <div class="card">${area('Ghi chú', 'ghiChu', c.ghiChu)}</div>
+      <button type="button" class="btn" data-act="saveCase">Lưu vụ án</button>
+    </form></main>`;
+  }
+  function syncCaseDraft() {
+    const form = $('#cform'); if (!form || !ui.cdraft) return;
+    for (const [k, v] of new FormData(form).entries()) if (k in ui.cdraft) ui.cdraft[k] = String(v).trim();
+  }
+
+  // ---------- Thống kê ----------
+  const ST_FIELDS = [['vuAn', 'Vụ án'], ['dtv', 'Điều tra viên'], ['ksv', 'Kiểm sát viên'], ['toiDanh', 'Tội danh'], ['bienPhap', 'Biện pháp ngăn chặn'], ['giaiDoan', 'Giai đoạn']];
+  function statsData() {
+    const f = ui.st; const Y = f.nam; const start = `${Y}-01-01`;
+    const personFilter = ['dtv', 'ksv', 'toiDanh', 'bienPhap', 'giaiDoan'].some((k) => f[k]);
+    const rs = records.filter((r) => ['dtv', 'ksv', 'toiDanh', 'bienPhap', 'giaiDoan'].every((k) => !f[k] || r[k] === f[k]) && (!f.vuAn || normName(r.vuAn) === normName(f.vuAn)));
+    const byCase = new Map();
+    for (const r of rs) { const k = normName(r.vuAn); if (!k) continue; if (!byCase.has(k)) byCase.set(k, []); byCase.get(k).push(r); }
+    const first = (list, k) => list.map((r) => r[k]).filter(Boolean).sort()[0] || '';
+    const cs = cases.filter((c) => (!f.vuAn || normName(c.ten) === normName(f.vuAn)) && (byCase.has(normName(c.ten)) || !personFilter)).map((c) => {
+      const list = byCase.get(normName(c.ten)) || [];
+      return { c, rs: list, kt: c.ngayKTVA || first(list, 'ngayKTVA'), kl: c.ngayKLDT || first(list, 'ngayKLDT'), st: caseStatus(c, list) };
+    });
+    const inY = (d) => !!d && d.slice(0, 4) === Y;
+    const stopped = (g) => g === 'dinhchi' || g === 'tamdinhchi';
+    // Còn tồn ở đầu năm: chưa kết luận trước 01/01, hoặc đã kết luận nhưng bị trả điều tra bổ sung chưa xong trước 01/01.
+    const openAtStart = (r) => !stopped(r.giaiDoan) && !(r.ngayKLDT && r.ngayKLDT < start && r.dtbs.every((b) => b.ngayKL && b.ngayKL < start));
+    const P = (fn) => rs.filter(fn); const C = (fn) => cs.filter(fn);
+    const bsP = (fn) => P((r) => r.dtbs.some(fn)); const bsC = (fn) => C((x) => x.rs.some((r) => r.dtbs.some(fn)));
+    const d = { rs, cs, Y, rows: [] };
+    const row = (label, c, p, cls = '') => d.rows.push({ label, c: c == null ? '' : c.length, p: p == null ? '' : p.length, cls });
+    const dangDT = (g) => g === 'dieutra' || g === 'dtbs';
+    if (Y) {
+      const tonP = P((r) => r.ngayKTBC && r.ngayKTBC < start && openAtStart(r));
+      const tonC = C((x) => x.kt && x.kt < start && !stopped(x.st) && (x.rs.length ? x.rs.some(openAtStart) : !(x.kl && x.kl < start)));
+      const moiP = P((r) => inY(r.ngayKTBC)); const moiC = C((x) => inY(x.kt));
+      row(`Tồn cũ chuyển sang năm ${Y}`, tonC, tonP, 'strong');
+      for (const g of ['dieutra', 'dtbs', 'ketluan', 'truyto', 'xetxu']) {
+        const pc = tonP.filter((r) => r.giaiDoan === g); const cc = tonC.filter((x) => x.st === g);
+        if (pc.length || cc.length) row(`hiện ${GIAI_DOAN[g].toLowerCase()}`, cc, pc, 'sub');
+      }
+      row(`Khởi tố mới trong năm ${Y}`, moiC, moiP, 'strong');
+      for (const g of ['dieutra', 'dtbs', 'ketluan', 'truyto', 'xetxu', 'tamdinhchi', 'dinhchi']) {
+        const pc = moiP.filter((r) => r.giaiDoan === g); const cc = moiC.filter((x) => x.st === g);
+        if (pc.length || cc.length) row(`hiện ${GIAI_DOAN[g].toLowerCase()}`, cc, pc, 'sub');
+      }
+      row('Tổng thụ lý trong năm', [...tonC, ...moiC], [...tonP, ...moiP], 'strong');
+      row('Kết luận điều tra trong năm', C((x) => inY(x.kl) || x.rs.some((r) => inY(r.ngayKLDT))), P((r) => inY(r.ngayKLDT)), 'strong');
+      row('Viện kiểm sát trả điều tra bổ sung', bsC((b) => b.gd !== 'toa' && inY(b.ngayTra)), bsP((b) => b.gd !== 'toa' && inY(b.ngayTra)));
+      row('Toà án trả điều tra bổ sung', bsC((b) => b.gd === 'toa' && inY(b.ngayTra)), bsP((b) => b.gd === 'toa' && inY(b.ngayTra)));
+      row('Kết luận điều tra bổ sung trong năm', bsC((b) => inY(b.ngayKL)), bsP((b) => inY(b.ngayKL)));
+    } else {
+      row('Tổng số', cs, rs, 'strong');
+      row('Đã kết luận điều tra', C((x) => x.kl), P((r) => r.ngayKLDT), 'strong');
+    }
+    row('Hiện đang điều tra', C((x) => dangDT(x.st)), P((r) => dangDT(r.giaiDoan)), 'strong');
+    row('trong đó điều tra bổ sung', C((x) => x.st === 'dtbs'), P((r) => r.giaiDoan === 'dtbs'), 'sub');
+    d.noDateP = P((r) => !r.ngayKTBC).length; d.noDateC = C((x) => !x.kt).length;
+    return d;
+  }
+  function viewStats() {
+    const f = ui.st; const d = statsData();
+    const years = new Set([String(new Date().getFullYear())]);
+    for (const r of records) for (const k of ['ngayKTBC', 'ngayKTVA', 'ngayKLDT']) if (r[k]) years.add(r[k].slice(0, 4));
+    for (const c of cases) for (const k of ['ngayKTVA', 'ngayKLDT']) if (c[k]) years.add(c[k].slice(0, 4));
+    if (f.nam) years.add(f.nam);
+    const opt = (v, t, cur) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''}>${esc(t)}</option>`;
+    const values = (k) => (k === 'vuAn' ? cases.map((c) => c.ten) : [...new Set(records.map((r) => r[k]).filter(Boolean))]).sort((a, b) => fold(a).localeCompare(fold(b)));
+    const label = (k, v) => (k === 'bienPhap' ? BIEN_PHAP[v] : k === 'giaiDoan' ? GIAI_DOAN[v] : v) || v;
+    const group = (title, fn) => {
+      const m = new Map(); for (const r of d.rs) { const v = fn(r); if (v === null) continue; const k = v || '(chưa ghi)'; m.set(k, (m.get(k) || 0) + 1); }
+      const rows = [...m.entries()].sort((a, b) => b[1] - a[1]);
+      return rows.length ? `<h3 class="section-title">${title}</h3><div class="card">${rows.map(([k, n]) => `<div class="trow one"><span>${esc(k)}</span><b>${n}</b></div>`).join('')}</div>` : '';
+    };
+    const active = ST_FIELDS.some(([k]) => f[k]);
+    return `${bar('Thống kê')}
+    <main class="content">
+      <div class="card">
+        <label class="field"><span>Năm</span><select data-st="nam">${opt('', 'Tất cả các năm', f.nam)}${[...years].sort().reverse().map((y) => opt(y, `Năm ${y}`, f.nam)).join('')}</select></label>
+        ${ST_FIELDS.map(([k, t]) => `<label class="field"><span>${t}</span><select data-st="${k}">${opt('', 'Tất cả', f[k])}${values(k).map((v) => opt(v, label(k, v), f[k])).join('')}</select></label>`).join('')}
+      </div>
+      ${active ? '<button class="btn plain" data-act="clearStats">Bỏ lọc</button>' : ''}
+      <h3 class="section-title">${f.nam ? `Số liệu năm ${f.nam}` : 'Số liệu tất cả các năm'}</h3>
+      <div class="card">
+        <div class="trow head"><span></span><b>Vụ</b><b>Bị can</b></div>
+        ${d.rows.map((r) => `<div class="trow ${r.cls}"><span>${esc(r.label)}</span><b>${r.c}</b><b>${r.p}</b></div>`).join('')}
+      </div>
+      <p class="note">Vụ tính theo ngày khởi tố vụ án, bị can tính theo ngày khởi tố bị can. Hồ sơ đình chỉ, tạm đình chỉ không tính vào tồn cũ.${d.noDateP || d.noDateC ? ` Còn ${d.noDateC} vụ và ${d.noDateP} bị can chưa ghi ngày khởi tố nên chưa được tính vào tồn cũ / khởi tố mới.` : ''}</p>
+      ${group('Bị can theo giai đoạn', (r) => GIAI_DOAN[r.giaiDoan])}
+      ${group('Điều tra bổ sung theo lần và cơ quan trả', (r) => (r.giaiDoan === 'dtbs' && r.dtbs.length ? `Lần ${r.dtbs.length} — ${CO_QUAN_TRA[r.dtbs[r.dtbs.length - 1].gd] || CO_QUAN_TRA.vks}` : null))}
+      ${group('Bị can theo biện pháp ngăn chặn', (r) => BIEN_PHAP[r.bienPhap])}
+      ${group('Bị can theo tội danh', (r) => r.toiDanh)}
+      ${group('Bị can theo điều tra viên', (r) => r.dtv)}
     </main>`;
   }
 
@@ -352,6 +612,10 @@
         kv('Thời hạn', r.tgTu || r.tgDen ? `${vn(r.tgTu) || '…'} → ${vn(r.tgDen) || '…'}` : ''),
         ...(r.giaHan || []).map((g, i) => kv(`Gia hạn lần ${i + 1}`, `${g.so ? 'Số ' + g.so + '\n' : ''}${g.loai ? g.loai + '\n' : ''}${vn(g.tu) || '…'} → ${vn(g.den) || '…'}`)),
       ])}
+      ${block('Kết luận điều tra', [
+        kv('Bản kết luận điều tra', so('', r.soKLDT, r.ngayKLDT)),
+        ...(r.dtbs || []).map((b, i) => kv(`Điều tra bổ sung lần ${i + 1}`, `${CO_QUAN_TRA[b.gd] || CO_QUAN_TRA.vks}${b.ngayTra ? ' ngày ' + vn(b.ngayTra) : ''}\n${b.ngayKL || b.so ? 'Kết luận bổ sung ' + so('', b.so, b.ngayKL) : 'Chưa kết luận bổ sung'}`)),
+      ])}
       ${block('Thụ lý', [kv('Điều tra viên', r.dtv), kv('Kiểm sát viên', r.ksv)])}
       ${block('Ghi chú', [r.ghiChu ? `<div class="pad" style="white-space:pre-wrap">${esc(r.ghiChu)}</div>` : ''])}
       <button class="btn danger" data-act="delete" data-id="${esc(r.id)}">Xoá hồ sơ này</button>
@@ -363,7 +627,7 @@
   function blank() {
     return { id: uid(), hoTen: '', tenKhac: '', gioiTinh: 'Nam', ngaySinh: '', cccd: '', quocTich: 'Việt Nam', danToc: 'Kinh', ngheNghiep: '', hktt: '', choO: '', tienAn: '', anh: '',
       vuAn: '', soQDKTVA: '', ngayKTVA: '', toiDanh: '', dieuKhoan: '', soQDKTBC: '', ngayKTBC: '', giaiDoan: 'dieutra',
-      bienPhap: 'tamgiam', ngayBat: '', noiGiam: '', soLenh: '', loaiHan: '', tgTu: '', tgDen: '', giaHan: [], dtv: '', ksv: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
+      bienPhap: 'tamgiam', ngayBat: '', noiGiam: '', soLenh: '', loaiHan: '', tgTu: '', tgDen: '', giaHan: [], soKLDT: '', ngayKLDT: '', dtbs: [], dtv: '', ksv: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
   }
   function inp(label, name, v, type = 'text', extra = '') {
     return `<label class="field"><span>${esc(label)}</span><input name="${name}" type="${type}" value="${esc(v)}" autocomplete="off" ${extra}></label>`;
@@ -391,9 +655,7 @@
         <button type="button" class="row" data-act="pickScan"><div class="main"><div class="name link">Quét văn bản để tự điền (ảnh, PDF)</div><div class="sub">Quyết định khởi tố, lệnh tạm giam… Đọc chữ ngay trên máy</div></div></button>
         <input id="scanFile" type="file" accept="image/*,application/pdf,.pdf" multiple hidden>
       </div>
-      ${ui.scan ? `<div class="card pad scan-note" style="margin-top:10px"><b>Đã tự điền ${ui.scan.filled.length} mục từ văn bản — hãy kiểm tra lại từng mục trước khi lưu.</b>
-        ${ui.scan.filled.length ? `<p>${esc(ui.scan.filled.join(', '))}</p>` : '<p>Không dò được thông tin nào. Thử ảnh rõ hơn, chụp thẳng, đủ sáng.</p>'}
-        <details><summary>Xem chữ đọc được</summary><pre>${esc(ui.scan.text)}</pre></details></div>` : ''}
+      ${scanNote('Bị can')}
       <h3 class="section-title">Lý lịch</h3>
       <div class="card">
         ${inp('Họ và tên *', 'hoTen', r.hoTen, 'text', 'autocapitalize="words" required')}
@@ -442,6 +704,23 @@
         </div>`).join('')}
         <button type="button" class="row" data-act="addExt"><div class="main"><div class="name link">+ Thêm lần gia hạn</div></div></button>
       </div>
+      <h3 class="section-title">Kết luận điều tra</h3>
+      <div class="card">
+        ${inp('Bản kết luận điều tra số', 'soKLDT', r.soKLDT)}
+        ${inp('Ngày kết luận điều tra', 'ngayKLDT', r.ngayKLDT, 'date')}
+      </div>
+      <h3 class="section-title">Điều tra bổ sung</h3>
+      <div class="card">
+        ${(r.dtbs || []).map((b, i) => `<div class="ext">
+          <div class="ext-head"><span>Điều tra bổ sung lần ${i + 1}</span><button type="button" data-act="delBs" data-i="${i}">Xoá</button></div>
+          ${sel('Cơ quan trả hồ sơ', `bs${i}_gd`, b.gd || 'vks', { vks: 'Viện kiểm sát', toa: 'Toà án' })}
+          ${inp('Ngày trả hồ sơ', `bs${i}_ngayTra`, b.ngayTra, 'date')}
+          ${inp('Bản kết luận điều tra bổ sung số', `bs${i}_so`, b.so)}
+          ${inp('Ngày kết luận điều tra bổ sung', `bs${i}_ngayKL`, b.ngayKL, 'date')}
+        </div>`).join('')}
+        <button type="button" class="row" data-act="addBs"><div class="main"><div class="name link">+ Thêm lần điều tra bổ sung</div></div></button>
+      </div>
+      <p class="note">Khi lưu, giai đoạn tự chuyển sang "Điều tra bổ sung" nếu lần trả hồ sơ gần nhất chưa có ngày kết luận bổ sung, và sang "Đã kết luận điều tra" khi đã có ngày kết luận.</p>
       <h3 class="section-title">Thụ lý & ghi chú</h3>
       <div class="card">
         ${inp('Điều tra viên thụ lý', 'dtv', r.dtv, 'text', 'autocapitalize="words"')}
@@ -455,8 +734,10 @@
     const form = $('#form'); if (!form || !ui.draft) return;
     const fd = new FormData(form); const r = ui.draft;
     for (const [k, v] of fd.entries()) {
-      const m = /^gh(\d+)_(so|loai|tu|den)$/.exec(k);
-      if (m) { if (r.giaHan[+m[1]]) r.giaHan[+m[1]][m[2]] = String(v).trim(); } else if (k in r) r[k] = String(v).trim();
+      const m = /^gh(\d+)_(so|loai|tu|den)$/.exec(k); const b = /^bs(\d+)_(gd|ngayTra|so|ngayKL)$/.exec(k);
+      if (m) { if (r.giaHan[+m[1]]) r.giaHan[+m[1]][m[2]] = String(v).trim(); }
+      else if (b) { if (r.dtbs[+b[1]]) r.dtbs[+b[1]][b[2]] = String(v).trim(); }
+      else if (k in r) r[k] = String(v).trim();
     }
   }
 
@@ -477,7 +758,7 @@
   const FIELD_NAMES = { hoTen: 'Họ tên', tenKhac: 'Tên gọi khác', gioiTinh: 'Giới tính', ngaySinh: 'Ngày sinh', cccd: 'CCCD', quocTich: 'Quốc tịch', danToc: 'Dân tộc',
     ngheNghiep: 'Nghề nghiệp', hktt: 'Nơi thường trú', choO: 'Chỗ ở', tienAn: 'Tiền án, tiền sự', vuAn: 'Vụ án', soQDKTVA: 'Số QĐ khởi tố vụ án', ngayKTVA: 'Ngày khởi tố vụ án',
     toiDanh: 'Tội danh', dieuKhoan: 'Điều khoản', soQDKTBC: 'Số QĐ khởi tố bị can', ngayKTBC: 'Ngày khởi tố bị can', bienPhap: 'Biện pháp ngăn chặn', ngayBat: 'Ngày bắt',
-    noiGiam: 'Nơi giam giữ', soLenh: 'Số lệnh', tgTu: 'Từ ngày', tgDen: 'Đến ngày', giaHan: 'Gia hạn', dtv: 'Điều tra viên', ksv: 'Kiểm sát viên' };
+    noiGiam: 'Nơi giam giữ', soLenh: 'Số lệnh', tgTu: 'Từ ngày', tgDen: 'Đến ngày', giaHan: 'Gia hạn', soKLDT: 'Số kết luận điều tra', ngayKLDT: 'Ngày kết luận điều tra', dtbs: 'Kết luận điều tra bổ sung', dtv: 'Điều tra viên', ksv: 'Kiểm sát viên' };
   const ALWAYS_SET = ['bienPhap', 'gioiTinh', 'quocTich', 'danToc'];
   // Điền kết quả quét vào hồ sơ: không ghi đè ô người dùng đã nhập. Trả về tên các mục đã điền.
   function applyScan(r, got) {
@@ -485,9 +766,22 @@
     for (const [k, v] of Object.entries(got)) {
       if (!(k in FIELD_NAMES)) continue;
       if (k === 'giaHan') { r.giaHan.push(...v.map((g) => ({ so: g.so || '', loai: '', tu: g.tu || '', den: g.den || '' }))); filled.push(FIELD_NAMES[k]); continue; }
+      if (k === 'dtbs') {
+        // Bản kết luận bổ sung: điền vào lần trả hồ sơ đang chờ kết luận, nếu không có thì thêm lần mới.
+        const last = r.dtbs[r.dtbs.length - 1];
+        for (const b of v) { if (last && !last.ngayKL && !last.so) { last.so = b.so || ''; last.ngayKL = b.ngayKL || ''; } else r.dtbs.push({ gd: 'vks', ngayTra: '', so: b.so || '', ngayKL: b.ngayKL || '' }); }
+        filled.push(FIELD_NAMES[k]); continue;
+      }
       if (r[k] === v) continue;
       if (!r[k] || ALWAYS_SET.includes(k)) { r[k] = v; filled.push(FIELD_NAMES[k]); }
     }
+    return filled;
+  }
+  const CASE_FIELDS = { ten: ['vuAn', 'Tên vụ án'], soQDKTVA: ['soQDKTVA', 'Số QĐ khởi tố vụ án'], ngayKTVA: ['ngayKTVA', 'Ngày khởi tố vụ án'], toiDanh: ['toiDanh', 'Tội danh'],
+    dieuKhoan: ['dieuKhoan', 'Điều khoản'], dtv: ['dtv', 'Điều tra viên'], soKLDT: ['soKLDT', 'Số kết luận điều tra'], ngayKLDT: ['ngayKLDT', 'Ngày kết luận điều tra'] };
+  function applyCaseScan(c, got) {
+    const filled = [];
+    for (const [k, [from, label]] of Object.entries(CASE_FIELDS)) if (!c[k] && got[from]) { c[k] = got[from]; filled.push(label); }
     return filled;
   }
   function busy_(msg) {
@@ -501,25 +795,49 @@
     let res;
     try { res = Scan.parse(await Scan.read(files, busy_)); } finally { busy_(null); Scan.dispose(); }
     if (!key) return; // app đã tự khoá trong lúc quét
-    if (res.persons.length > 1 && !(ui.page && ui.page.type === 'form' && records.some((x) => x.id === ui.draft.id))) {
+    const type = ui.page && ui.page.type;
+    const inForm = type === 'form'; const inCaseForm = type === 'caseForm';
+    const fromCases = type === 'case' || (!ui.page && ui.tab === 'cases');
+    const named = res.persons.filter((p) => p.hoTen);
+    const done = (n) => toast(n ? `Đã tự điền ${n} mục — hãy kiểm tra lại` : 'Không dò được thông tin từ văn bản');
+
+    // Văn bản về vụ án (quyết định khởi tố vụ án…): điền vào vụ án, không tạo bị can.
+    if (inCaseForm || (!inForm && (fromCases || (res.type === 'ktva' && !named.length)))) {
+      const got = res.common || {}; let existed = false;
+      if (inCaseForm) syncCaseDraft();
+      else {
+        const ex = (got.soQDKTVA && cases.find((c) => c.soQDKTVA === got.soQDKTVA)) || caseByName(got.vuAn);
+        existed = !!ex; ui.cdraft = ex ? clone(ex) : blankCase(); ui.page = { type: 'caseForm', from: ui.page };
+      }
+      ui.scan = { filled: applyCaseScan(ui.cdraft, got), text: res.text, existed };
+      render(); done(ui.scan.filled.length); return;
+    }
+
+    if (named.length > 1 && !(inForm && records.some((x) => x.id === ui.draft.id))) {
       ui.draft = null;
-      ui.page = { type: 'scanReview', persons: res.persons.map((p) => ({ on: true, got: p })), text: res.text, from: null };
+      ui.page = { type: 'scanReview', persons: named.map((p) => ({ on: true, got: p })), text: res.text, from: null };
       render(); return;
     }
-    if (!(ui.page && ui.page.type === 'form')) { ui.draft = blank(); ui.page = { type: 'form', from: ui.page }; } else syncDraft();
-    ui.scan = { filled: applyScan(ui.draft, res.persons[0] || {}), text: res.text };
-    render();
-    toast(ui.scan.filled.length ? `Đã tự điền ${ui.scan.filled.length} mục — hãy kiểm tra lại` : 'Không dò được thông tin từ văn bản');
+    const got = named[0] || res.persons[0] || {}; let existed = false;
+    if (inForm) syncDraft();
+    else {
+      // Bị can đã có hồ sơ thì bổ sung vào hồ sơ cũ thay vì tạo hồ sơ trùng.
+      const ex = findExisting(got);
+      existed = !!ex; ui.draft = ex ? normalize(clone(ex)) : blank(); ui.page = { type: 'form', from: ui.page };
+    }
+    const filled = applyScan(ui.draft, got); linkCase(ui.draft);
+    ui.scan = { filled, text: res.text, existed };
+    render(); done(filled.length);
   }
   function viewScanReview() {
     const pg = ui.page; const n = pg.persons.filter((p) => p.on).length;
     return `${bar('Kết quả quét', '<button data-act="back">Huỷ</button>')}
     <main class="content nopad-bottom">
-      <div class="card pad scan-note"><b>Tìm thấy ${pg.persons.length} bị can trong văn bản.</b><p>Bỏ chọn người không cần lưu. Sau khi lưu, mở từng hồ sơ để kiểm tra và sửa lại.</p>
+      <div class="card pad scan-note"><b>Tìm thấy ${pg.persons.length} bị can trong văn bản.</b><p>Bỏ chọn người không cần lưu. Người đã có hồ sơ sẽ được bổ sung thông tin, không tạo hồ sơ trùng. Sau khi lưu, mở từng hồ sơ để kiểm tra lại.</p>
         <details><summary>Xem chữ đọc được</summary><pre>${esc(pg.text)}</pre></details></div>
       <div class="card" style="margin-top:10px">${pg.persons.map((p, i) => `<button class="row" data-act="scanToggle" data-i="${i}">
         <span class="check ${p.on ? 'on' : ''}">${p.on ? '✓' : ''}</span>
-        <div class="main"><div class="name">${esc(p.got.hoTen || '(chưa đọc được họ tên)')}</div>
+        <div class="main"><div class="name">${esc(p.got.hoTen || '(chưa đọc được họ tên)')} ${findExisting(p.got) ? '<span class="tag orange">Đã có hồ sơ</span>' : ''}</div>
         <div class="sub" style="white-space:normal">${esc([p.got.ngaySinh ? 'Sinh ' + vn(p.got.ngaySinh) : '', p.got.cccd ? 'CCCD ' + p.got.cccd : '', p.got.toiDanh, p.got.hktt].filter(Boolean).join(' · '))}</div></div></button>`).join('')}</div>
       <button class="btn" data-act="scanSave" ${n ? '' : 'disabled'}>Lưu ${n} hồ sơ</button>
     </main>`;
@@ -549,7 +867,7 @@
 
   // ---------- Dựng giao diện ----------
   function viewTab() {
-    const body = { home: viewHome, list: viewList, cases: viewCases, settings: viewSettings }[ui.tab]();
+    const body = { home: viewHome, list: viewList, cases: viewCases, stats: viewStats, settings: viewSettings }[ui.tab]();
     return body + tabs();
   }
   function render(keepScroll) {
@@ -561,10 +879,11 @@
     else if (ui.page.type === 'case') app.innerHTML = viewCase(ui.page.name);
     else if (ui.page.type === 'pass') app.innerHTML = viewPass();
     else if (ui.page.type === 'scanReview') app.innerHTML = viewScanReview();
+    else if (ui.page.type === 'caseForm') app.innerHTML = viewCaseForm();
     window.scrollTo(0, keepScroll ? y : 0);
   }
   function lock() {
-    key = null; records = []; ui.page = null; ui.draft = null; ui.scan = null; ui.lockErr = '';
+    key = null; records = []; cases = []; ui.page = null; ui.draft = null; ui.cdraft = null; ui.scan = null; ui.lockErr = '';
     render();
   }
 
@@ -599,6 +918,7 @@
       app: 'qlbc', v: 1, at: new Date().toISOString(),
       salt: b64(auth.salt), iter: auth.iter, check: { iv: b64(auth.check.iv), ct: b64(auth.check.ct) },
       records: rows.map((r) => ({ iv: b64(r.iv), ct: b64(r.ct) })),
+      cases: (await tx('vuan', 'readonly', (s) => s.getAll())).map((r) => ({ iv: b64(r.iv), ct: b64(r.ct) })),
     };
     await saveFile(`bican-saoluu-${today()}.qlbc`, JSON.stringify(data), 'application/json');
   }
@@ -612,11 +932,20 @@
     if (!k) { toast('Sai mật khẩu bản sao lưu'); return; }
     let added = 0; let updated = 0;
     for (const row of data.records) {
-      const r = await unseal(k, { iv: unb64(row.iv), ct: unb64(row.ct) });
+      const r = normalize(await unseal(k, { iv: unb64(row.iv), ct: unb64(row.ct) }));
       const old = records.find((x) => x.id === r.id);
       if (old && (old.updatedAt || 0) >= (r.updatedAt || 0)) continue;
       await putRecord(r); if (old) updated++; else added++;
     }
+    for (const row of data.cases || []) {
+      const c = await unseal(k, { iv: unb64(row.iv), ct: unb64(row.ct) });
+      const old = cases.find((x) => x.id === c.id) || caseByName(c.ten);
+      if (!old) { await putCase(c); continue; }
+      // Vụ án đã có: giữ bản đang có, chỉ lấy thêm các ô còn trống.
+      let ch = false; for (const [f, v] of Object.entries(c)) if (!old[f] && v) { old[f] = v; ch = true; }
+      if (ch) await putCase(old);
+    }
+    await syncCases();
     toast(`Đã khôi phục: thêm ${added}, cập nhật ${updated} hồ sơ`);
     render();
   }
@@ -630,7 +959,9 @@
       ['Giai đoạn', (r) => GIAI_DOAN[r.giaiDoan]], ['Biện pháp ngăn chặn', (r) => BIEN_PHAP[r.bienPhap]], ['Ngày bắt', (r) => vn(r.ngayBat)],
       ['Nơi giam giữ', (r) => r.noiGiam], ['Lệnh số', (r) => r.soLenh], ['Loại thời hạn', (r) => r.loaiHan], ['Từ ngày', (r) => vn(r.tgTu)], ['Đến ngày', (r) => vn(r.tgDen)],
       ['Gia hạn', (r) => (r.giaHan || []).map((g, i) => `Lần ${i + 1}: ${g.so || ''} ${g.loai || ''} ${vn(g.tu)}-${vn(g.den)}`).join('; ')],
-      ['Hạn hiện tại', (r) => vn(deadlineOf(r))], ['Điều tra viên', (r) => r.dtv], ['Kiểm sát viên', (r) => r.ksv], ['Ghi chú', (r) => r.ghiChu],
+      ['Hạn hiện tại', (r) => vn(deadlineOf(r))], ['KLĐT số', (r) => r.soKLDT], ['Ngày KLĐT', (r) => vn(r.ngayKLDT)],
+      ['Điều tra bổ sung', (r) => (r.dtbs || []).map((b, i) => `Lần ${i + 1}: ${CO_QUAN_TRA[b.gd] || CO_QUAN_TRA.vks} ${vn(b.ngayTra)}; KL bổ sung ${b.so || ''} ${vn(b.ngayKL)}`).join(' | ')],
+      ['Điều tra viên', (r) => r.dtv], ['Kiểm sát viên', (r) => r.ksv], ['Ghi chú', (r) => r.ghiChu],
     ];
     // Thêm dấu ' trước ô bắt đầu bằng = + - @ để Excel không coi là công thức; CCCD giữ dạng chữ.
     const cell = (v) => { let s = String(v ?? ''); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return `"${s.replace(/"/g, '""')}"`; };
@@ -645,30 +976,89 @@
     goFilter(el) { ui.tab = 'list'; ui.filter = el.dataset.filter; ui.q = ''; render(); },
     filter(el) { ui.filter = el.dataset.filter; render(true); },
     open(el) { ui.page = { type: 'detail', id: el.dataset.id, from: ui.page }; render(); },
-    case(el) { ui.page = { type: 'case', name: el.dataset.name }; render(); },
+    case(el) { ui.page = { type: 'case', name: el.dataset.name, from: ui.page }; render(); },
     back() { ui.page = (ui.page && ui.page.from) || null; render(); },
-    new() { ui.scan = null; ui.draft = blank(); if (ui.page && ui.page.type === 'case' && ui.page.name !== 'Chưa gắn vụ án') ui.draft.vuAn = ui.page.name; ui.page = { type: 'form', from: ui.page }; render(); },
-    edit(el) {
-      const r = records.find((x) => x.id === el.dataset.id); if (!r) return;
-      ui.scan = null; ui.draft = JSON.parse(JSON.stringify(r)); ui.draft.giaHan = ui.draft.giaHan || []; ui.draft.loaiHan = ui.draft.loaiHan || '';
+    new() {
+      ui.scan = null; ui.draft = blank();
+      const c = ui.page && ui.page.type === 'case' && caseByName(ui.page.name);
+      if (c) { ui.draft.vuAn = c.ten; for (const k of CASE_SEED) ui.draft[k] = c[k] || ''; }
       ui.page = { type: 'form', from: ui.page }; render();
     },
-    cancel() { ui.draft = null; ui.scan = null; ui.page = ui.page.from || null; render(); },
+    newCase() { ui.scan = null; ui.cdraft = blankCase(); ui.page = { type: 'caseForm', from: ui.page }; render(); },
+    editCase(el) {
+      const c = cases.find((x) => x.id === el.dataset.id); if (!c) return;
+      ui.scan = null; ui.cdraft = clone(c); ui.page = { type: 'caseForm', from: ui.page }; render();
+    },
+    async saveCase() {
+      syncCaseDraft(); const c = ui.cdraft;
+      if (!c.ten) { toast('Vui lòng nhập tên vụ án'); return; }
+      const other = caseByName(c.ten);
+      if (other && other.id !== c.id) { toast('Đã có vụ án cùng tên'); return; }
+      const old = cases.find((x) => x.id === c.id);
+      const people = records.filter((r) => normName(r.vuAn) === normName(old ? old.ten : c.ten));
+      c.updatedAt = Date.now(); await putCase(c);
+      // Đồng bộ sang các bị can trong vụ: tên vụ, quyết định khởi tố vụ án, ngày kết luận điều tra (nếu bị can chưa có).
+      for (const r of people) {
+        const before = JSON.stringify(r);
+        r.vuAn = c.ten;
+        for (const k of ['soQDKTVA', 'ngayKTVA']) if (c[k]) r[k] = c[k];
+        if (c.ngayKLDT && !r.ngayKLDT) { r.ngayKLDT = c.ngayKLDT; if (!r.soKLDT) r.soKLDT = c.soKLDT; autoStage(r); }
+        if (JSON.stringify(r) !== before) { r.updatedAt = Date.now(); await putRecord(r); }
+      }
+      ui.cdraft = null; ui.scan = null; ui.tab = 'cases';
+      ui.page = { type: 'case', name: c.ten, from: null }; toast('Đã lưu vụ án'); render();
+    },
+    async delCase(el) {
+      const c = cases.find((x) => x.id === el.dataset.id); if (!c || casePeople(c).length) return;
+      if (!confirm(`Xoá vụ án "${c.ten}"?`)) return;
+      await removeCase(c.id); ui.page = null; ui.tab = 'cases'; toast('Đã xoá vụ án'); render();
+    },
+    async mergeDups() {
+      const groups = dupGroups(); if (!groups.length) return;
+      const desc = groups.map((g) => `• ${g[0].hoTen} (${g.length} hồ sơ)`).join('\n');
+      if (!confirm(`Gộp các hồ sơ trùng sau, mỗi người còn một hồ sơ?\n${desc}\n\nThông tin của các hồ sơ được dồn lại. Không thể hoàn tác, nên xuất bản sao lưu trước.`)) return;
+      for (const g of groups) {
+        const base = mergeGroup(g); await putRecord(base);
+        for (const o of g) if (o.id !== base.id) await removeRecord(o.id);
+      }
+      toast(`Đã gộp ${groups.length} bị can bị trùng`); render();
+    },
+    clearStats() { for (const [k] of ST_FIELDS) ui.st[k] = ''; render(true); },
+    addBs() { syncDraft(); ui.draft.dtbs.push({ gd: 'vks', ngayTra: '', so: '', ngayKL: '' }); render(true); },
+    delBs(el) { syncDraft(); ui.draft.dtbs.splice(Number(el.dataset.i), 1); render(true); },
+    edit(el) {
+      const r = records.find((x) => x.id === el.dataset.id); if (!r) return;
+      ui.scan = null; ui.draft = normalize(clone(r));
+      ui.page = { type: 'form', from: ui.page }; render();
+    },
+    cancel() { ui.draft = null; ui.cdraft = null; ui.scan = null; ui.page = ui.page.from || null; render(); },
     pickScan() { $('#scanFile').click(); },
     newScan() { $('#scanFile').click(); },
     scanToggle(el) { const p = ui.page.persons[Number(el.dataset.i)]; p.on = !p.on; render(true); },
     async scanSave() {
-      const list = ui.page.persons.filter((p) => p.on);
-      for (const p of list) { const r = blank(); applyScan(r, p.got); if (!r.hoTen) r.hoTen = '(chưa đọc được họ tên)'; await putRecord(r); }
-      ui.page = null; ui.tab = 'list'; ui.filter = 'all'; ui.q = ''; toast(`Đã lưu ${list.length} hồ sơ — hãy mở từng hồ sơ để kiểm tra`); render();
+      const list = ui.page.persons.filter((p) => p.on); let added = 0; let merged = 0;
+      for (const p of list) {
+        const ex = findExisting(p.got);
+        const r = ex ? normalize(clone(ex)) : blank();
+        applyScan(r, p.got); linkCase(r); autoStage(r); r.updatedAt = Date.now();
+        await putRecord(r); await ensureCase(r.vuAn, r);
+        if (ex) merged++; else added++;
+      }
+      ui.page = null; ui.tab = 'list'; ui.filter = 'all'; ui.q = '';
+      toast(`Thêm ${added} hồ sơ mới, bổ sung ${merged} hồ sơ đã có — hãy mở từng hồ sơ để kiểm tra`); render();
     },
     async save() {
       syncDraft(); const r = ui.draft;
       if (!r.hoTen) { toast('Vui lòng nhập họ và tên'); return; }
       if (r.tgTu && r.tgDen && r.tgDen < r.tgTu) { toast('"Đến ngày" phải sau "từ ngày"'); return; }
       r.giaHan = r.giaHan.filter((g) => g.so || g.tu || g.den);
+      r.dtbs = r.dtbs.filter((b) => b.ngayTra || b.so || b.ngayKL);
+      const isNew = !records.some((x) => x.id === r.id);
+      const dup = isNew && findExisting(r);
+      if (dup && !confirm(`Đã có hồ sơ của "${dup.hoTen}"${dup.ngaySinh ? ' sinh ' + vn(dup.ngaySinh) : ''}. Vẫn lưu thành một hồ sơ mới?`)) return;
+      linkCase(r); autoStage(r);
       r.updatedAt = Date.now();
-      await putRecord(r);
+      await putRecord(r); await ensureCase(r.vuAn, r);
       ui.draft = null; ui.scan = null;
       const from = ui.page.from;
       ui.page = from && from.type === 'detail' ? from : { type: 'detail', id: r.id, from };
@@ -710,6 +1100,7 @@
       if (!confirm('Xoá TOÀN BỘ hồ sơ và mật khẩu trên máy này? Không thể hoàn tác.')) return;
       if (prompt('Gõ XOA để xác nhận:') !== 'XOA') { toast('Đã huỷ'); return; }
       await tx('bican', 'readwrite', (s) => s.clear());
+      await tx('vuan', 'readwrite', (s) => s.clear());
       await tx('meta', 'readwrite', (s) => s.clear());
       auth = null; settings = defaultSettings(); lock();
     },
@@ -733,6 +1124,12 @@
       if (t.id === 'alertDays') {
         settings.alertDays = Math.min(60, Math.max(1, parseInt(t.value, 10) || 10));
         await metaSet('settings', settings); render(true); toast('Đã lưu cài đặt');
+      } else if (t.dataset.st) {
+        ui.st[t.dataset.st] = t.value; render(true);
+      } else if (t.name === 'vuAn' && ui.draft) {
+        // Chọn vụ án đã có thì lấy sẵn quyết định khởi tố vụ án, tội danh cho các ô còn trống.
+        const c = caseByName(t.value);
+        if (c) for (const k of CASE_SEED) { const el = $(`#form [name=${k}]`); if (el && !el.value && c[k]) el.value = c[k]; }
       } else if (t.dataset.term != null) {
         const row = settings.terms[Number(t.dataset.term)];
         if (t.dataset.k === 'ngay') row.ngay = Math.min(3650, Math.max(1, parseInt(t.value, 10) || 1));
@@ -771,7 +1168,7 @@
         else {
           const made = await makeAuth(p1);
           await metaSet('auth', made.auth);
-          auth = made.auth; key = made.key; records = []; ui.lockErr = ''; ui.tab = 'home';
+          auth = made.auth; key = made.key; records = []; cases = []; ui.lockErr = ''; ui.tab = 'home';
           if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
         }
         render();
@@ -786,10 +1183,13 @@
         const made = await makeAuth(f.p1.value);
         const rows = [];
         for (const r of records) { const box = await seal(made.key, r); rows.push({ id: r.id, iv: box.iv, ct: box.ct }); }
+        const crows = [];
+        for (const c of cases) { const box = await seal(made.key, c); crows.push({ id: c.id, iv: box.iv, ct: box.ct }); }
         // Ghi hồ sơ và thông tin mật khẩu trong cùng một giao dịch để không bao giờ lệch khoá.
         await new Promise((res, rej) => {
-          const t = db.transaction(['bican', 'meta'], 'readwrite');
+          const t = db.transaction(['bican', 'vuan', 'meta'], 'readwrite');
           rows.forEach((row) => t.objectStore('bican').put(row));
+          crows.forEach((row) => t.objectStore('vuan').put(row));
           t.objectStore('meta').put(made.auth, 'auth');
           t.oncomplete = res; t.onerror = () => rej(t.error); t.onabort = () => rej(t.error);
         });
@@ -802,7 +1202,7 @@
   let hiddenAt = 0;
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) hiddenAt = Date.now();
-    else if (key && hiddenAt && Date.now() - hiddenAt > (ui.page && ui.page.type === 'form' ? 10 : 1) * AUTO_LOCK_MS) lock();
+    else if (key && hiddenAt && Date.now() - hiddenAt > (ui.page && ['form', 'caseForm', 'scanReview'].includes(ui.page.type) ? 10 : 1) * AUTO_LOCK_MS) lock();
   });
 
   // ---------- Khởi động ----------
@@ -823,7 +1223,7 @@
       // Khi bản mới của app đã sẵn sàng thì tải lại trang để dùng ngay (trừ lúc đang nhập dở biểu mẫu).
       sw.addEventListener('controllerchange', () => {
         if (!hadController) return;
-        if (ui.page && (ui.page.type === 'form' || ui.page.type === 'scanReview')) toast('Đã có bản mới, sẽ áp dụng khi mở lại app');
+        if (ui.page && ['form', 'caseForm', 'scanReview'].includes(ui.page.type)) toast('Đã có bản mới, sẽ áp dụng khi mở lại app');
         else location.reload();
       });
       sw.register('sw.js').then((reg) => {

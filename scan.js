@@ -157,9 +157,9 @@ const Scan = (() => {
 
   function crimeFields(f, src) {
     const o = {};
-    const t = /ve toi\s*[:：]?\s*["“”']?\s*([^\n]{3,160}?)\s*["“”']?\s*[,.]?\s*(?:quy dinh tai|theo quy dinh|theo (?:diem|khoan|dieu)|pham vao|xay ra)/d.exec(f)
+    const t = /ve toi(?!\s*pham\b)\s*[:：]?\s*["“”']?\s*([^\n]{3,160}?)\s*["“”']?\s*[,.]?\s*(?:quy dinh tai|theo quy dinh|theo (?:diem|khoan|dieu)|pham vao|xay ra)/d.exec(f)
       || /toi danh\s*[:：]\s*([^\n;]{3,160})/d.exec(f)
-      || /ve toi\s*[:：]?\s*["“”']?\s*([^\n;.,]{3,120})/d.exec(f);
+      || /ve toi(?!\s*pham\b)\s*[:：]?\s*["“”']?\s*([^\n;.,]{3,120})/d.exec(f);
     if (t) o.toiDanh = clean(src.slice(t.indices[1][0], t.indices[1][1]));
     // Lấy chỗ ghi đầy đủ nhất (có điểm, khoản) trong các lần nhắc tới điều luật.
     const dk = [...f.matchAll(/((?:diem\s+[a-z](?:\s*,\s*[a-z])*\s*,?\s*)?(?:khoan\s+\d+\s*,?\s*)?dieu\s+\d+[a-z]?)\s*(?:cua\s*)?(?:bo luat hinh su|blhs)/gd)]
@@ -169,6 +169,7 @@ const Scan = (() => {
   }
 
   const TYPES = [
+    ['kldtbs', /ban ket luan dieu tra bo sung|ket luan dieu tra bo sung/], ['kldt', /ban ket luan dieu tra/],
     ['giahan', /quyet dinh gia han tam giam/], ['ktbc', /quyet dinh khoi to bi can/], ['ktva', /quyet dinh khoi to vu an/],
     ['tamgiam', /lenh tam giam|lenh bat bi can de tam giam/], ['tamgiu', /quyet dinh tam giu/], ['camdi', /lenh cam di khoi noi cu tru/],
   ];
@@ -207,13 +208,26 @@ const Scan = (() => {
     }
     if (type === 'giahan') { o.bienPhap = 'tamgiam'; o.giaHan = [{ so: docSo, loai: '', tu, den }]; }
     if (!type && tu) { o.tgTu = tu; if (den) o.tgDen = den; }
+    if (type === 'kldt') { if (docSo) o.soKLDT = docSo; if (docNgay) o.ngayKLDT = docNgay; }
+    if (type === 'kldtbs') o.dtbs = [{ so: docSo, ngayKL: docNgay }];
+    o.docType = type;
 
     const ng = /(tr[aạ]i t[aạ]m giam|nh[aà] t[aạ]m gi[uữ]|trai tam giam|nha tam giu|co so giam giu)[^\n,;.]{0,60}/d.exec(f);
     if (ng) o.noiGiam = clean(src.slice(ng.indices[0][0], ng.indices[0][1])).replace(/^./, (c) => c.toUpperCase());
     const nb = new RegExp(`(?:bi bat|bat giu|bat qua tang|bi tam giu|tam giu)[^\\n\\d]{0,25}?ngay\\s*${DATE}`).exec(f);
     if (nb) o.ngayBat = mkDate(nb[1], nb[2], nb[3]);
-    const v = /vu an(?:\s*hinh su)?\s*[:：]?\s*["“”']?\s*([^\n;]{6,160}?)\s*["“”']?\s*(?=[;\n]|\.\s|,\s*(?:can cu|theo|quy dinh)|$)/d.exec(f);
-    if (v) { const name = clean(src.slice(v.indices[1][0], v.indices[1][1])); if (!/^(so|ngay|nay|tren|do)\b/.test(fold(name))) o.vuAn = name; }
+    // Tên vụ án: phần đứng sau "(khởi tố) vụ án hình sự …" cho tới hết câu, bỏ đoạn viện dẫn điều luật.
+    for (const m of f.matchAll(/vu an(?: hinh su)?[ ]*[:：]?[ ]*(?:ve toi[ ]*[:：]?[ ]*)?(["“”']?[^\n;]{6,240})/gd)) {
+      const a = m.indices[1][0]; let b = m.indices[1][1]; const seg = f.slice(a, b);
+      if (/^["“”']?\s*(so|ngay|nay|tren|do|va|theo|de|nhu|cho|den|duoc|co|khong|thuoc|noi tren|hinh su)\b|^\d/.test(seg)) continue;
+      const cut = /(?<!\b(?:tp|tx|tt|q|p|h|x|kp))\.(?:\s|$)|,?\s*(?:quy dinh tai|theo quy dinh|theo (?:diem|khoan|dieu)|can cu)\b/.exec(seg);
+      if (cut) b = a + cut.index;
+      const raw = src.slice(a, b); const name = clean(raw.replace(/["“”]/g, ' '));
+      if (name.length < 6) continue;
+      o.vuAn = name;
+      const q = /^\s*["“”']\s*([^"“”']{3,120})["“”']/.exec(raw); if (q) o.toiDanhVuAn = clean(q[1]);
+      break;
+    }
     o.dtv = titleCase(field(f, src, 'dieu tra vien(?: thu ly)?', true));
     o.ksv = titleCase(field(f, src, 'kiem sat vien(?: thu ly)?', true));
     return o;
@@ -247,6 +261,9 @@ const Scan = (() => {
     const src = unwrap(String(text || '').normalize('NFC').replace(/\r/g, '').replace(/[ \t\u00a0]+/g, ' '));
     const f = fold(src);
     const common = Object.assign(commonFields(f, src), crimeFields(f, src));
+    const type = common.docType || ''; delete common.docType;
+    if (!common.toiDanh && common.toiDanhVuAn) common.toiDanh = common.toiDanhVuAn;
+    delete common.toiDanhVuAn;
     const marks = [...f.matchAll(new RegExp(NAME_RE, 'gd'))].filter((m) => m.indices[1][1] > m.indices[1][0]);
     const persons = [];
     if (marks.length) {
@@ -270,7 +287,7 @@ const Scan = (() => {
       for (const [k, v] of Object.entries(Object.assign({}, common, p))) if (v && (!Array.isArray(v) || v.length)) r[k] = v;
       return r;
     }).filter((r) => Object.keys(r).length);
-    return { persons: out, text: src };
+    return { persons: out, text: src, type, common };
   }
 
   async function dispose() { if (worker) { const w = worker; worker = null; try { await w.terminate(); } catch (e) { /* bỏ qua */ } } }
