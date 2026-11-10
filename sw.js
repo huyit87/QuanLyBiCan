@@ -1,6 +1,6 @@
 // Service worker: lưu sẵn giao diện để app chạy được khi không có mạng.
 // Đổi VERSION mỗi khi cập nhật mã nguồn để iPhone tải bản mới.
-const VERSION = 'qlbc-v1';
+const VERSION = 'qlbc-v2';
 const FILES = [
   './',
   'index.html',

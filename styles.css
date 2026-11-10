@@ -174,6 +174,12 @@ h1, h2, h3, p { margin: 0; }
 .field textarea { resize: vertical; min-height: 64px; }
 .field select { background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%); background-position: calc(100% - 11px) 14px, calc(100% - 6px) 14px; background-size: 5px 5px; background-repeat: no-repeat; padding-right: 22px; }
 .quick { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 14px 12px; align-items: center; font-size: 13px; color: var(--muted); }
+.term { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--line); }
+.term input { border: 0; background: transparent; outline: none; font-size: 16px; padding: 4px 0; min-width: 0; -webkit-appearance: none; appearance: none; }
+.term input[data-k="ten"] { flex: 1; }
+.term input[data-k="ngay"] { width: 56px; text-align: right; }
+.term span { color: var(--muted); font-size: 14px; }
+.term button { color: var(--red); padding: 4px 6px; }
 .quick button { padding: 5px 10px; border-radius: 14px; background: var(--blue-bg); color: var(--accent); font-size: 13px; font-weight: 600; }
 .ext { border-bottom: 1px solid var(--line); }
 .ext-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 14px 0; font-size: 13px; color: var(--muted); }

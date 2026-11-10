@@ -25,6 +25,16 @@
   };
   const GIAM_GIU = ['tamgiam', 'tamgiu'];
   const TAI_NGOAI = ['camdi', 'baolinh', 'dattien'];
+  // Bảng tra số ngày theo loại thời hạn (sửa được trong Cài đặt).
+  // Đến ngày = từ ngày + số ngày − 1, tương đương công thức Excel =B4+VLOOKUP(A4;bảng;2;0)-1
+  const DEFAULT_TERMS = [
+    { ten: 'Tạm giữ 3 ngày', ngay: 3 },
+    { ten: '1 tháng', ngay: 30 },
+    { ten: '2 tháng', ngay: 60 },
+    { ten: '3 tháng', ngay: 90 },
+    { ten: '4 tháng', ngay: 120 },
+  ];
+  const defaultSettings = () => ({ alertDays: 10, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
   const PBKDF2_ITER = 310000;
   const AUTO_LOCK_MS = 60 * 1000;
 
@@ -115,7 +125,7 @@
   let key = null;            // khoá AES, chỉ giữ trong bộ nhớ khi đã mở khoá
   let auth = null;           // { salt, iter, check }
   let records = [];          // hồ sơ đã giải mã
-  let settings = { alertDays: 10 };
+  let settings = defaultSettings();
   const ui = { tab: 'home', page: null, q: '', filter: 'all', draft: null, lockErr: '' };
 
   async function loadRecords() {
@@ -140,6 +150,16 @@
     if (!GIAM_GIU.includes(r.bienPhap) || r.giaiDoan === 'dinhchi') return null;
     const ds = [r.tgDen, ...(r.giaHan || []).map((g) => g.den)].filter(Boolean).sort();
     return ds.length ? ds[ds.length - 1] : null;
+  }
+  function termDays(ten) {
+    const t = (settings.terms || []).find((x) => x.ten === ten);
+    return t && t.ngay > 0 ? t.ngay : 0;
+  }
+  function termOpts(cur) {
+    const o = { '': '— Tự nhập "đến ngày" —' };
+    for (const t of settings.terms || []) if (t.ten) o[t.ten] = `${t.ten} — ${t.ngay} ngày`;
+    if (cur && !(cur in o)) o[cur] = `${cur} (không còn trong bảng)`;
+    return o;
   }
   function dlInfo(r) {
     const d = deadlineOf(r);
@@ -268,6 +288,14 @@
       <div class="card"><label class="field"><span>Cảnh báo trước khi hết hạn tạm giữ, tạm giam (ngày)</span>
         <input id="alertDays" type="number" inputmode="numeric" min="1" max="60" value="${settings.alertDays}"></label></div>
 
+      <h3 class="section-title">Bảng thời hạn (loại → số ngày)</h3>
+      <div class="card">
+        ${(settings.terms || []).map((t, i) => `<div class="term"><input data-term="${i}" data-k="ten" value="${esc(t.ten)}" placeholder="Tên loại thời hạn" autocomplete="off"><input data-term="${i}" data-k="ngay" type="number" inputmode="numeric" min="1" value="${esc(t.ngay)}" aria-label="Số ngày"><span>ngày</span><button data-act="delTerm" data-i="${i}" aria-label="Xoá">✕</button></div>`).join('')}
+        <button class="row" data-act="addTerm"><div class="main"><div class="name link">+ Thêm loại thời hạn</div></div></button>
+        <button class="row" data-act="resetTerms"><div class="main"><div class="name link">Đặt lại mặc định</div></div></button>
+      </div>
+      <p class="note">Đến ngày = từ ngày + số ngày − 1 (tính cả ngày bắt đầu). Sửa bảng không làm thay đổi các hồ sơ đã lưu.</p>
+
       <h3 class="section-title">Sao lưu</h3>
       <div class="card">
         <button class="row" data-act="backup"><div class="main"><div class="name link">Xuất bản sao lưu (đã mã hoá)</div><div class="sub">Lưu vào Tệp / iCloud Drive để phòng mất máy</div></div></button>
@@ -316,8 +344,9 @@
       ${block('Biện pháp ngăn chặn', [
         kv('Biện pháp', BIEN_PHAP[r.bienPhap]), kv('Ngày bắt / tạm giữ', vn(r.ngayBat)), kv('Nơi giam giữ', r.noiGiam),
         kv('Lệnh / quyết định số', r.soLenh),
+        kv('Loại thời hạn', r.loaiHan),
         kv('Thời hạn', r.tgTu || r.tgDen ? `${vn(r.tgTu) || '…'} → ${vn(r.tgDen) || '…'}` : ''),
-        ...(r.giaHan || []).map((g, i) => kv(`Gia hạn lần ${i + 1}`, `${g.so ? 'Số ' + g.so + '\n' : ''}${vn(g.tu) || '…'} → ${vn(g.den) || '…'}`)),
+        ...(r.giaHan || []).map((g, i) => kv(`Gia hạn lần ${i + 1}`, `${g.so ? 'Số ' + g.so + '\n' : ''}${g.loai ? g.loai + '\n' : ''}${vn(g.tu) || '…'} → ${vn(g.den) || '…'}`)),
       ])}
       ${block('Thụ lý', [kv('Điều tra viên', r.dtv), kv('Kiểm sát viên', r.ksv)])}
       ${block('Ghi chú', [r.ghiChu ? `<div class="pad" style="white-space:pre-wrap">${esc(r.ghiChu)}</div>` : ''])}
@@ -330,7 +359,7 @@
   function blank() {
     return { id: uid(), hoTen: '', tenKhac: '', gioiTinh: 'Nam', ngaySinh: '', cccd: '', quocTich: 'Việt Nam', danToc: 'Kinh', ngheNghiep: '', hktt: '', choO: '', tienAn: '', anh: '',
       vuAn: '', soQDKTVA: '', ngayKTVA: '', toiDanh: '', dieuKhoan: '', soQDKTBC: '', ngayKTBC: '', giaiDoan: 'dieutra',
-      bienPhap: 'tamgiam', ngayBat: '', noiGiam: '', soLenh: '', tgTu: '', tgDen: '', giaHan: [], dtv: '', ksv: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
+      bienPhap: 'tamgiam', ngayBat: '', noiGiam: '', soLenh: '', loaiHan: '', tgTu: '', tgDen: '', giaHan: [], dtv: '', ksv: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
   }
   function inp(label, name, v, type = 'text', extra = '') {
     return `<label class="field"><span>${esc(label)}</span><input name="${name}" type="${type}" value="${esc(v)}" autocomplete="off" ${extra}></label>`;
@@ -386,19 +415,17 @@
         ${inp('Ngày bắt / tạm giữ', 'ngayBat', r.ngayBat, 'date')}
         ${inp('Nơi giam giữ', 'noiGiam', r.noiGiam)}
         ${inp('Lệnh / quyết định số', 'soLenh', r.soLenh)}
+        ${sel('Loại thời hạn', 'loaiHan', r.loaiHan || '', termOpts(r.loaiHan))}
         ${inp('Thời hạn từ ngày', 'tgTu', r.tgTu, 'date')}
         ${inp('Đến ngày', 'tgDen', r.tgDen, 'date')}
-        <div class="quick">Tính nhanh "đến ngày":
-          <button type="button" data-act="quick" data-m="2">2 tháng</button>
-          <button type="button" data-act="quick" data-m="3">3 tháng</button>
-          <button type="button" data-act="quick" data-m="4">4 tháng</button>
-          <span>(1 tháng = 30 ngày; luôn đối chiếu với lệnh)</span></div>
+        <div class="quick">Chọn loại thời hạn thì "đến ngày" tự tính = từ ngày + số ngày − 1. Bảng số ngày sửa trong Cài đặt.</div>
       </div>
       <h3 class="section-title">Gia hạn tạm giam</h3>
       <div class="card">
         ${(r.giaHan || []).map((g, i) => `<div class="ext">
           <div class="ext-head"><span>Gia hạn lần ${i + 1}</span><button type="button" data-act="delExt" data-i="${i}">Xoá</button></div>
           ${inp('Lệnh / quyết định số', `gh${i}_so`, g.so)}
+          ${sel('Loại thời hạn', `gh${i}_loai`, g.loai || '', termOpts(g.loai))}
           ${inp('Từ ngày', `gh${i}_tu`, g.tu, 'date')}
           ${inp('Đến ngày', `gh${i}_den`, g.den, 'date')}
         </div>`).join('')}
@@ -417,7 +444,7 @@
     const form = $('#form'); if (!form || !ui.draft) return;
     const fd = new FormData(form); const r = ui.draft;
     for (const [k, v] of fd.entries()) {
-      const m = /^gh(\d+)_(so|tu|den)$/.exec(k);
+      const m = /^gh(\d+)_(so|loai|tu|den)$/.exec(k);
       if (m) { if (r.giaHan[+m[1]]) r.giaHan[+m[1]][m[2]] = String(v).trim(); } else if (k in r) r[k] = String(v).trim();
     }
   }
@@ -537,8 +564,8 @@
       ['Vụ án', (r) => r.vuAn], ['QĐ KTVA số', (r) => r.soQDKTVA], ['Ngày KTVA', (r) => vn(r.ngayKTVA)],
       ['Tội danh', (r) => r.toiDanh], ['Điều khoản', (r) => r.dieuKhoan], ['QĐ KTBC số', (r) => r.soQDKTBC], ['Ngày KTBC', (r) => vn(r.ngayKTBC)],
       ['Giai đoạn', (r) => GIAI_DOAN[r.giaiDoan]], ['Biện pháp ngăn chặn', (r) => BIEN_PHAP[r.bienPhap]], ['Ngày bắt', (r) => vn(r.ngayBat)],
-      ['Nơi giam giữ', (r) => r.noiGiam], ['Lệnh số', (r) => r.soLenh], ['Từ ngày', (r) => vn(r.tgTu)], ['Đến ngày', (r) => vn(r.tgDen)],
-      ['Gia hạn', (r) => (r.giaHan || []).map((g, i) => `Lần ${i + 1}: ${g.so || ''} ${vn(g.tu)}-${vn(g.den)}`).join('; ')],
+      ['Nơi giam giữ', (r) => r.noiGiam], ['Lệnh số', (r) => r.soLenh], ['Loại thời hạn', (r) => r.loaiHan], ['Từ ngày', (r) => vn(r.tgTu)], ['Đến ngày', (r) => vn(r.tgDen)],
+      ['Gia hạn', (r) => (r.giaHan || []).map((g, i) => `Lần ${i + 1}: ${g.so || ''} ${g.loai || ''} ${vn(g.tu)}-${vn(g.den)}`).join('; ')],
       ['Hạn hiện tại', (r) => vn(deadlineOf(r))], ['Điều tra viên', (r) => r.dtv], ['Kiểm sát viên', (r) => r.ksv], ['Ghi chú', (r) => r.ghiChu],
     ];
     // Thêm dấu ' trước ô bắt đầu bằng = + - @ để Excel không coi là công thức; CCCD giữ dạng chữ.
@@ -559,7 +586,7 @@
     new() { ui.draft = blank(); if (ui.page && ui.page.type === 'case' && ui.page.name !== 'Chưa gắn vụ án') ui.draft.vuAn = ui.page.name; ui.page = { type: 'form', from: ui.page }; render(); },
     edit(el) {
       const r = records.find((x) => x.id === el.dataset.id); if (!r) return;
-      ui.draft = JSON.parse(JSON.stringify(r)); ui.draft.giaHan = ui.draft.giaHan || [];
+      ui.draft = JSON.parse(JSON.stringify(r)); ui.draft.giaHan = ui.draft.giaHan || []; ui.draft.loaiHan = ui.draft.loaiHan || '';
       ui.page = { type: 'form', from: ui.page }; render();
     },
     cancel() { ui.draft = null; ui.page = ui.page.from || null; render(); },
@@ -580,15 +607,16 @@
       if (!confirm(`Xoá hồ sơ bị can "${r.hoTen}"? Không thể hoàn tác.`)) return;
       await removeRecord(r.id); ui.page = ui.page.from || null; toast('Đã xoá'); render();
     },
-    quick(el) {
-      syncDraft(); const r = ui.draft;
-      if (!r.tgTu) { toast('Nhập "thời hạn từ ngày" trước'); return; }
-      r.tgDen = addDays(r.tgTu, 30 * Number(el.dataset.m) - 1); render(true);
+    addTerm() { settings.terms.push({ ten: '', ngay: 30 }); render(true); },
+    async delTerm(el) { settings.terms.splice(Number(el.dataset.i), 1); await metaSet('settings', settings); render(true); },
+    async resetTerms() {
+      if (!confirm('Đặt lại bảng thời hạn về mặc định?')) return;
+      settings.terms = defaultSettings().terms; await metaSet('settings', settings); render(true);
     },
     addExt() {
       syncDraft(); const r = ui.draft;
       const last = [r.tgDen, ...r.giaHan.map((g) => g.den)].filter(Boolean).sort().pop();
-      r.giaHan.push({ so: '', tu: last ? addDays(last, 1) : '', den: '' }); render(true);
+      r.giaHan.push({ so: '', loai: '', tu: last ? addDays(last, 1) : '', den: '' }); render(true);
     },
     delExt(el) { syncDraft(); ui.draft.giaHan.splice(Number(el.dataset.i), 1); render(true); },
     pickPhoto() { $('#photoFile').click(); },
@@ -603,7 +631,7 @@
       if (prompt('Gõ XOA để xác nhận:') !== 'XOA') { toast('Đã huỷ'); return; }
       await tx('bican', 'readwrite', (s) => s.clear());
       await tx('meta', 'readwrite', (s) => s.clear());
-      auth = null; settings = { alertDays: 10 }; lock();
+      auth = null; settings = defaultSettings(); lock();
     },
   };
 
@@ -625,6 +653,22 @@
       if (t.id === 'alertDays') {
         settings.alertDays = Math.min(60, Math.max(1, parseInt(t.value, 10) || 10));
         await metaSet('settings', settings); render(true); toast('Đã lưu cài đặt');
+      } else if (t.dataset.term != null) {
+        const row = settings.terms[Number(t.dataset.term)];
+        if (t.dataset.k === 'ngay') row.ngay = Math.min(3650, Math.max(1, parseInt(t.value, 10) || 1));
+        else row.ten = t.value.trim();
+        await metaSet('settings', settings); render(true);
+      } else if (ui.draft && /^(loaiHan|tgTu|gh\d+_(loai|tu))$/.test(t.name || '')) {
+        // Tự tính "đến ngày" = từ ngày + số ngày tra theo loại thời hạn − 1
+        syncDraft();
+        const m = /^gh(\d+)_/.exec(t.name);
+        const o = m ? ui.draft.giaHan[+m[1]] : ui.draft;
+        const days = termDays(m ? o.loai : o.loaiHan); const tu = m ? o.tu : o.tgTu;
+        if (days && tu) {
+          const den = addDays(tu, days - 1);
+          if (m) o.den = den; else o.tgDen = den;
+          $(`[name=${m ? `gh${m[1]}_den` : 'tgDen'}]`).value = den;
+        }
       } else if (t.id === 'photoFile' && t.files[0]) {
         syncDraft(); ui.draft.anh = await readPhoto(t.files[0]); render(true);
       } else if (t.id === 'restoreFile' && t.files[0]) {
@@ -685,6 +729,7 @@
       db = await openDB();
       auth = (await metaGet('auth')) || null;
       settings = Object.assign(settings, (await metaGet('settings')) || {});
+      if (!Array.isArray(settings.terms)) settings.terms = defaultSettings().terms;
     } catch (err) {
       app.innerHTML = `<div class="lock"><p class="warn">Không mở được bộ nhớ của trình duyệt (${esc(err && err.message)}). Hãy tắt chế độ duyệt riêng tư rồi thử lại.</p></div>`;
       return;
