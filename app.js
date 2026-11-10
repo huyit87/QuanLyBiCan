@@ -35,6 +35,7 @@
     { ten: '4 tháng', ngay: 120 },
   ];
   const defaultSettings = () => ({ alertDays: 10, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
+  const APP_VERSION = '4'; // tăng cùng lúc với VERSION trong sw.js
   const PBKDF2_ITER = 310000;
   const AUTO_LOCK_MS = 60 * 1000;
 
@@ -313,7 +314,8 @@
         <button class="row" data-act="wipe"><div class="main"><div class="name link danger">Xoá toàn bộ dữ liệu</div></div></button>
       </div>
       <p class="note">Dữ liệu chỉ lưu trên máy này và được mã hoá bằng mật khẩu. Ứng dụng tự khoá sau 1 phút rời khỏi màn hình. Quên mật khẩu sẽ không thể khôi phục dữ liệu.</p>
-      <p class="note">${records.length} hồ sơ · phiên bản 1.0</p>
+      <p class="note">${records.length} hồ sơ · phiên bản ${APP_VERSION}</p>
+      <button class="btn plain" data-act="update">Kiểm tra bản cập nhật</button>
     </main>`;
   }
 
@@ -692,6 +694,14 @@
     pickPhoto() { $('#photoFile').click(); },
     dropPhoto() { syncDraft(); ui.draft.anh = ''; render(true); },
     lock() { lock(); },
+    async update() {
+      const reg = navigator.serviceWorker && await navigator.serviceWorker.getRegistration();
+      if (!reg) { location.reload(); return; }
+      toast('Đang kiểm tra…');
+      await reg.update();
+      // Có bản mới thì trang tự tải lại khi bản mới sẵn sàng (xem controllerchange bên dưới).
+      setTimeout(() => { if (!reg.installing && !reg.waiting) toast(`Đang dùng bản mới nhất (phiên bản ${APP_VERSION})`); }, 1500);
+    },
     passPage() { ui.page = { type: 'pass' }; render(); },
     async backup() { if (!records.length) { toast('Chưa có dữ liệu để sao lưu'); return; } await exportBackup(); },
     restore() { $('#restoreFile').click(); },
@@ -807,8 +817,21 @@
       return;
     }
     render();
-    if ('serviceWorker' in navigator && location.protocol === 'https:' || location.hostname === 'localhost') {
-      navigator.serviceWorker && navigator.serviceWorker.register('sw.js').catch(() => {});
+    if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+      const sw = navigator.serviceWorker;
+      const hadController = !!sw.controller;
+      // Khi bản mới của app đã sẵn sàng thì tải lại trang để dùng ngay (trừ lúc đang nhập dở biểu mẫu).
+      sw.addEventListener('controllerchange', () => {
+        if (!hadController) return;
+        if (ui.page && (ui.page.type === 'form' || ui.page.type === 'scanReview')) toast('Đã có bản mới, sẽ áp dụng khi mở lại app');
+        else location.reload();
+      });
+      sw.register('sw.js').then((reg) => {
+        let last = Date.now();
+        document.addEventListener('visibilitychange', () => {
+          if (!document.hidden && Date.now() - last > 60000) { last = Date.now(); reg.update().catch(() => {}); }
+        });
+      }).catch(() => {});
     }
   })();
 })();
