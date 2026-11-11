@@ -144,7 +144,7 @@ const Scan = (() => {
   // Trang mở đầu một văn bản mới: có quốc hiệu, dòng "Số:", hoặc tên loại văn bản ở phần đầu trang.
   function startsDoc(text) {
     const head = fold(text.slice(0, 700));
-    return /cong hoa xa hoi chu nghia|doc lap\s*-\s*tu do/.test(head) || /\bso\s*[:：]/.test(head.slice(0, 400)) || TYPES.some(([, re]) => re.test(head));
+    return /cong hoa xa hoi chu nghia|doc lap\s*-\s*tu do/.test(head) || /\bso\s*[:：]/.test(head.slice(0, 400)) || TYPES.some(([, re]) => new RegExp(re.source.replace(/ /g, '\\s*')).test(head));
   }
   async function readDocs(files, onProgress = () => {}) {
     const docs = [];
@@ -306,7 +306,8 @@ const Scan = (() => {
     const o = {};
     let type = ''; let pos = Infinity;
     for (const [k, re] of TYPES) {
-      for (const m of f.matchAll(new RegExp(re.source, 'g'))) {
+      // cho phép các từ trong tiêu đề bị đọc dính liền hoặc cách xa nhau
+      for (const m of f.matchAll(new RegExp(re.source.replace(/ /g, '\\s*'), 'g'))) {
         const t = src.slice(m.index, m.index + m[0].length);
         if (t !== t.toUpperCase()) continue;            // chỉ nhận tiêu đề viết hoa, không nhận câu nhắc tới văn bản khác
         if (m.index < pos) { pos = m.index; type = k; }

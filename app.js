@@ -38,7 +38,7 @@
   ];
   // statDay/statMonth: ngày bắt đầu kỳ thống kê năm (mặc định 15/11: năm 2026 là 15/11/2025 – 14/11/2026).
   const defaultSettings = () => ({ alertDays: 10, statDay: 15, statMonth: 11, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
-  const APP_VERSION = '11'; // tăng cùng lúc với VERSION trong sw.js
+  const APP_VERSION = '12'; // tăng cùng lúc với VERSION trong sw.js
   const PBKDF2_ITER = 310000;
   const AUTO_LOCK_MS = 60 * 1000;
 
@@ -1014,7 +1014,11 @@
     render(); done(filled.length);
   }
   // Thứ tự ưu tiên khi nhiều văn bản cùng nói về một người: quyết định khởi tố bị can, lệnh, văn bản phê chuẩn, biên bản, công văn, lý lịch.
-  const DOC_RANK = { ktbc: 0, tamgiam: 1, tamgiu: 1, camdi: 1, pcktbc: 2, pclenh: 3, bbbat: 4, '': 5, lylich: 7 };
+  // Văn bản được phép lập bị can mới.
+  const CREATORS = ['pcktbc', 'pclenh', 'ktbc', 'tamgiam', 'tamgiu', 'camdi', 'giahan', 'kldt', 'kldtbs', 'tdc', 'dc'];
+  const DOC_NAMES = { pcktbc: 'QĐ phê chuẩn QĐ khởi tố bị can', pclenh: 'QĐ phê chuẩn lệnh bắt / lệnh tạm giam', ktbc: 'QĐ khởi tố bị can', tamgiam: 'lệnh bắt / lệnh tạm giam',
+    tamgiu: 'QĐ tạm giữ', camdi: 'lệnh cấm đi khỏi nơi cư trú', giahan: 'QĐ gia hạn tạm giam', kldt: 'bản kết luận điều tra', kldtbs: 'bản kết luận điều tra bổ sung', tdc: 'QĐ tạm đình chỉ', dc: 'QĐ đình chỉ' };
+  const DOC_RANK = { ktbc: 0, tamgiam: 1, tamgiu: 1, camdi: 1, pcktbc: 2, pclenh: 3, bbbat: 4, '': 5, lylich: 7 };   // thứ tự lấy lý lịch (quyết định khởi tố bị can ghi đủ nhất)
   const docRank = (res) => (res.type in DOC_RANK ? DOC_RANK[res.type] : 5);
   // Chọn giá trị được nhiều văn bản ghi giống nhau nhất (số quyết định: so theo phần số, lấy cách ghi đầy đủ nhất).
   function winner(values, isSo) {
@@ -1049,28 +1053,50 @@
     }
 
     // 2) Bị can
-    const touched = new Set();
-    for (const { d, res } of parsed.filter((x) => !['ktva', 'pcdtv'].includes(x.res.type)).sort((a, b) => docRank(a.res) - docRank(b.res))) {
-      const named = res.persons.filter((p) => p.hoTen);
-      if (!named.length) { if (!isCaseDoc(res)) log.push({ kind: 'none', file: d.name }); continue; }
-      vote('case', res.common, res.strong.filter((k) => k === 'soQDKTVA' || k === 'ngayKTVA'));
-      for (const got of named) {
-        const ex = findExisting(got);
-        const r = ex ? normalize(clone(ex)) : blank();
-        const filled = applyScan(r, got); linkCase(r);
-        if (!normName(r.vuAn)) {
-          // Gắn vào vụ theo mô tả vụ án trong văn bản; lượt này chỉ có một vụ án thì gắn vào vụ đó.
-          const c = caseBySig(res.common) || (batchCases.length === 1 ? cases.find((x) => x.id === batchCases[0].id) : null);
-          if (c) { r.vuAn = c.ten; linkCase(r); }
+    // Quy tắc: bị can chỉ được LẬP MỚI từ văn bản tố tụng xác định tư cách bị can — quyết định phê chuẩn
+    // quyết định khởi tố bị can, quyết định phê chuẩn lệnh bắt / lệnh tạm giam (Viện kiểm sát), quyết định khởi tố bị can,
+    // lệnh bắt, lệnh tạm giam, kết luận điều tra… Các văn bản khác (công văn, lý lịch, biên bản, phiếu xét nghiệm…)
+    // chỉ BỔ SUNG cho bị can đã có, không tự lập bị can mới.
+    const personDocs = parsed.filter((x) => !['ktva', 'pcdtv'].includes(x.res.type)).sort((a, b) => docRank(a.res) - docRank(b.res));
+    const anyCreator = personDocs.some((x) => CREATORS.includes(x.res.type) && x.res.persons.some((p) => p.hoTen));
+    const touched = new Set(); const names = new Map();
+    for (const pass of ['create', 'add']) {
+      for (const { d, res } of personDocs) {
+        const creator = !anyCreator || CREATORS.includes(res.type);   // hồ sơ không có văn bản nào như trên thì đành lập từ mọi văn bản
+        if ((pass === 'create') !== creator) continue;
+        const named = res.persons.filter((p) => p.hoTen);
+        if (!named.length) { if (!isCaseDoc(res)) log.push({ kind: 'none', file: d.name }); continue; }
+        vote('case', res.common, res.strong.filter((k) => k === 'soQDKTVA' || k === 'ngayKTVA'));
+        for (const got of named) {
+          const ex = findExisting(got);
+          if (!ex && !creator) { log.push({ kind: 'skip', file: d.name, name: got.hoTen }); continue; }
+          const r = ex ? normalize(clone(ex)) : blank();
+          const filled = applyScan(r, got); linkCase(r);
+          if (!normName(r.vuAn)) {
+            // Gắn vào vụ theo mô tả vụ án trong văn bản; lượt này chỉ có một vụ án thì gắn vào vụ đó.
+            const c = caseBySig(res.common) || (batchCases.length === 1 ? cases.find((x) => x.id === batchCases[0].id) : null);
+            if (c) { r.vuAn = c.ten; linkCase(r); }
+          }
+          stageFromStop(r, ex); autoStage(r); r.updatedAt = Date.now();
+          await putRecord(r);
+          touched.add(r.id); vote('p:' + r.id, got, res.strong);
+          if (!names.has(r.id)) names.set(r.id, []); names.get(r.id).push(got.hoTen);
+          note('person', r.id, d.name, !ex, filled);
+          const e = log.find((x) => x.kind === 'person' && x.id === r.id); if (creator && !e.from) e.from = DOC_NAMES[res.type] || 'văn bản';
         }
-        stageFromStop(r, ex); autoStage(r); r.updatedAt = Date.now();
-        await putRecord(r); await ensureCase(r.vuAn, r);
-        touched.add(r.id); vote('p:' + r.id, got, res.strong);
-        note('person', r.id, d.name, !ex, filled);
       }
     }
 
     // 3) Số, ngày quyết định lấy theo các văn bản in rõ (Viện kiểm sát, công văn), chọn giá trị được ghi nhiều nhất.
+    // Hồ sơ không có quyết định khởi tố vụ án: lập vụ án từ số, ngày khởi tố vụ án ghi trong văn bản phê chuẩn.
+    if (!batchCases.length && votes.has('case') && votes.get('case').soQDKTVA) {
+      const v = votes.get('case'); const so = winner(v.soQDKTVA, true); const ngay = v.ngayKTVA ? winner(v.ngayKTVA, false) : '';
+      const ex = caseBySo(so, ngay);
+      const c = ex ? normCase(clone(ex)) : blankCase();
+      if (!ex) { c.soQDKTVA = so; c.ngayKTVA = ngay; c.ten = uniqueName(`Vụ án theo QĐ ${so}`, c); c.updatedAt = Date.now(); await putCase(c); }
+      batchCases.push(c); note('case', c.id, '', !ex, ex ? [] : ['Số QĐ khởi tố vụ án', 'Ngày khởi tố vụ án']);
+      for (const id of touched) { const r = records.find((x) => x.id === id); if (r && !normName(r.vuAn)) { r.vuAn = c.ten; linkCase(r); await putRecord(r); } }
+    }
     if (batchCases.length === 1 && votes.has('case')) {
       const c = cases.find((x) => x.id === batchCases[0].id); const v = votes.get('case'); const filled = [];
       for (const k of ['soQDKTVA', 'ngayKTVA']) if (v[k]) { const w = winner(v[k], k.startsWith('so')); if (w && c[k] !== w) { c[k] = w; filled.push(CASE_FIELDS[k][1]); } }
@@ -1080,7 +1106,9 @@
       const r = records.find((x) => x.id === id); if (!r) continue;
       const v = votes.get('p:' + id) || {}; const before = JSON.stringify(r); const filled = [];
       for (const [k, vals] of Object.entries(v)) { const w = winner(vals, k.startsWith('so')); if (w && r[k] !== w) { r[k] = w; filled.push(FIELD_NAMES[k]); } }
-      linkCase(r);
+      // Họ tên: lấy cách viết được nhiều văn bản ghi nhất (tránh lỗi dấu của một văn bản đọc sai).
+      const nm = winner(names.get(id) || [], false); if (nm && normName(nm) === normName(r.hoTen)) r.hoTen = nm;
+      linkCase(r); await ensureCase(r.vuAn, r);
       if (JSON.stringify(r) !== before) { r.updatedAt = Date.now(); await putRecord(r); note('person', r.id, '', false, filled); }
     }
     await refreshAllCases();
@@ -1092,23 +1120,25 @@
     const pg = ui.page;
     const row = (it) => {
       if (it.kind === 'none') return `<div class="row"><div class="main"><div class="name">Không dò được thông tin</div><div class="sub">${esc(it.file)}</div></div></div>`;
+      if (it.kind === 'skip') return `<div class="row"><div class="main"><div class="name">${esc(it.name)}</div><div class="sub" style="white-space:normal">Không lập bị can: tên này chỉ có trong văn bản phụ, không có quyết định phê chuẩn / khởi tố bị can · ${esc(it.file)}</div></div></div>`;
       const c = it.kind === 'case' ? cases.find((x) => x.id === it.id) : null; const r = it.kind === 'person' ? records.find((x) => x.id === it.id) : null;
       if (!c && !r) return '';
       const vu = r && caseByName(r.vuAn);
       return `<button class="row" data-act="openItem" data-kind="${it.kind}" data-id="${esc(it.id)}"><div class="main">
         <div class="name" style="white-space:normal">${esc(c ? c.ten : r.hoTen)}</div>
-        <div class="sub" style="white-space:normal">${esc(c ? 'Vụ án' : 'Bị can')} · ${it.isNew ? 'tạo mới' : 'bổ sung vào hồ sơ đã có'} · điền ${it.filled.length} mục${r ? (vu ? ' · thuộc vụ: ' + esc(vu.ten) : ' · CHƯA GẮN VỤ ÁN') : ''}</div>
+        <div class="sub" style="white-space:normal">${esc(c ? 'Vụ án' : 'Bị can')} · ${it.isNew ? 'tạo mới' : 'bổ sung vào hồ sơ đã có'}${it.from ? ' · lập từ ' + esc(it.from) : ''} · điền ${it.filled.length} mục${r ? (vu ? ' · thuộc vụ: ' + esc(vu.ten) : ' · CHƯA GẮN VỤ ÁN') : ''}</div>
+        ${r ? `<div class="sub" style="white-space:normal">QĐ khởi tố bị can: ${esc(so(r.soQDKTBC, r.ngayKTBC) || 'chưa có')} · QĐ khởi tố vụ án: ${esc(so(r.soQDKTVA, r.ngayKTVA) || 'chưa có')}</div>` : ''}
         ${(() => { const m = missing(it.kind, c || r); return m.length ? `<div class="sub" style="white-space:normal;color:var(--orange)">Còn trống: ${esc(m.join(', '))}</div>` : ''; })()}
         <div class="sub">${esc(it.file)}</div></div><span class="chev">›</span></button>`;
     };
-    const cs = pg.log.filter((x) => x.kind === 'case'); const ps = pg.log.filter((x) => x.kind === 'person'); const no = pg.log.filter((x) => x.kind === 'none');
+    const cs = pg.log.filter((x) => x.kind === 'case'); const ps = pg.log.filter((x) => x.kind === 'person'); const no = pg.log.filter((x) => x.kind === 'none' || x.kind === 'skip');
     return `${bar('Kết quả đọc văn bản', '', '<button class="strong" data-act="back">Xong</button>')}
     <main class="content nopad-bottom">
-      <div class="card pad scan-note"><b>Đã đọc ${pg.docs.length} văn bản: ${cs.length} vụ án, ${ps.length} bị can${no.length ? `, ${no.length} văn bản không dò được` : ''}.</b>
+      <div class="card pad scan-note"><b>Đã đọc ${pg.docs.length} văn bản: ${cs.length} vụ án, ${ps.length} bị can${no.length ? `, ${no.length} mục không dùng để lập hồ sơ` : ''}.</b>
         <p>Thông tin đã được lưu. Hãy mở từng mục để đối chiếu với văn bản gốc và sửa chỗ đọc sai.</p></div>
       ${cs.length ? `<h3 class="section-title">Vụ án</h3><div class="card">${cs.map(row).join('')}</div>` : ''}
       ${ps.length ? `<h3 class="section-title">Bị can</h3><div class="card">${ps.map(row).join('')}</div>` : ''}
-      ${no.length ? `<h3 class="section-title">Chưa dò được</h3><div class="card">${no.map(row).join('')}</div>` : ''}
+      ${no.length ? `<h3 class="section-title">Không lập hồ sơ</h3><div class="card">${no.map(row).join('')}</div>` : ''}
       <h3 class="section-title">Chữ đọc được từ từng văn bản</h3>
       <div class="card pad scan-note" style="background:var(--card)">${pg.docs.map((d) => `<details><summary>${esc(d.name)}</summary><pre>${esc(d.text)}</pre></details>`).join('')}</div>
     </main>`;
