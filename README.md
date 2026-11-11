@@ -37,6 +37,7 @@ Khác với bản web:
 - Thống kê theo năm: khởi tố mới, tồn cũ chuyển sang, kết luận điều tra, trả điều tra bổ sung, đang điều tra — tính theo vụ và theo bị can, lọc theo vụ án, điều tra viên, kiểm sát viên, tội danh, biện pháp ngăn chặn, giai đoạn.
 - Tìm kiếm không dấu, lọc theo biện pháp ngăn chặn và giai đoạn tố tụng, nhóm bị can theo vụ án.
 - Quét văn bản (ảnh chụp hoặc PDF quyết định khởi tố, lệnh tạm giam, kết luận điều tra…) để tự điền hồ sơ; văn bản có nhiều bị can thì tạo nhiều hồ sơ. Việc đọc chữ chạy ngay trên máy, không gửi văn bản đi đâu. Kết quả chỉ là gợi ý, cần kiểm tra lại trước khi lưu. Lần đầu dùng cần có mạng để tải bộ đọc chữ (khoảng 6 MB), sau đó dùng được khi không có mạng.
+- Một tệp PDF gồm nhiều văn bản (cả tập hồ sơ) được tách theo trang và đọc từng văn bản. App nhận quyết định khởi tố vụ án / bị can, lệnh bắt bị can để tạm giam, quyết định phê chuẩn của Viện kiểm sát, quyết định phân công điều tra viên, biên bản bắt, công văn, lý lịch. Số và ngày viết tay không đọc được thì lấy từ chỗ in rõ trong các văn bản khác của cùng hồ sơ.
 - Trước khi đọc chữ, ảnh được làm sạch: lọc dấu đỏ đè lên chữ, xoá bóng đổ và nền tối quanh trang giấy, phóng to ảnh nhỏ. PDF có lớp chữ hỏng (phông chữ cũ) được đọc lại từ hình trang. Sau khi đọc, app báo các mục quan trọng còn trống.
 - Xuất bản sao lưu đã mã hoá (`.qlbc`), khôi phục, xuất danh sách ra Excel (CSV).
 - Chạy được khi không có mạng.

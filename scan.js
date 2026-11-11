@@ -99,10 +99,11 @@ const Scan = (() => {
     const { data } = await w.recognize(canvas, { rotateAuto: true });
     return data.text || '';
   }
-  async function readPdf(file, onProgress) {
+  // Trả về chữ của từng trang (mỗi trang một phần tử).
+  async function readPdfPages(file, onProgress) {
     const pdfjs = await getPdf();
     const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
-    const n = Math.min(doc.numPages, 20); const out = [];
+    const n = Math.min(doc.numPages, 60); const out = [];
     for (let i = 1; i <= n; i++) {
       const label = `Trang ${i}/${n}`;
       onProgress(`${label}: đang mở…`);
@@ -125,8 +126,9 @@ const Scan = (() => {
       }
       out.push(text);
     }
-    return out.join('\n');
+    return out;
   }
+  async function readPdf(file, onProgress) { return (await readPdfPages(file, onProgress)).join('\n'); }
   async function read(files, onProgress = () => {}) {
     const out = [];
     for (let i = 0; i < files.length; i++) {
@@ -139,18 +141,26 @@ const Scan = (() => {
 
   // Đọc và tách thành từng văn bản: mỗi PDF là một văn bản; ảnh có phần đầu văn bản ("Số: …", tên loại văn bản)
   // mở đầu một văn bản mới, ảnh không có thì là trang tiếp theo của văn bản trước.
+  // Trang mở đầu một văn bản mới: có quốc hiệu, dòng "Số:", hoặc tên loại văn bản ở phần đầu trang.
+  function startsDoc(text) {
+    const head = fold(text.slice(0, 700));
+    return /cong hoa xa hoi chu nghia|doc lap\s*-\s*tu do/.test(head) || /\bso\s*[:：]/.test(head.slice(0, 400)) || TYPES.some(([, re]) => re.test(head));
+  }
   async function readDocs(files, onProgress = () => {}) {
     const docs = [];
+    const push = (name, text, group) => {
+      const last = docs[docs.length - 1];
+      if (!startsDoc(text) && last && last.group === group) { last.text += '\n' + text; last.to = name; } else docs.push({ name, text, group });
+    };
     for (let i = 0; i < files.length; i++) {
       const f = files[i]; const label = files.length > 1 ? `Tệp ${i + 1}/${files.length}` : 'Ảnh';
-      if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) { docs.push({ name: f.name, text: await readPdf(f, (m) => onProgress(files.length > 1 ? `${label} — ${m}` : m)) }); continue; }
-      const text = await ocr(toCanvas(await fileToImage(f)), label, onProgress);
-      const head = fold(text.slice(0, 600));
-      const starts = /\bso\s*[:：]/.test(head) || TYPES.some(([, re]) => re.test(head)) || /cong hoa xa hoi chu nghia/.test(head);
-      const last = docs[docs.length - 1];
-      if (!starts && last && last.image) { last.text += '\n' + text; last.name += ', ' + f.name; } else docs.push({ name: f.name, text, image: true });
+      if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) {
+        // Một tệp PDF có thể chứa nhiều văn bản: tách theo trang, trang không có phần đầu văn bản là trang tiếp theo.
+        const pages = await readPdfPages(f, (m) => onProgress(files.length > 1 ? `${label} — ${m}` : m));
+        pages.forEach((t, k) => push(pages.length > 1 ? `${f.name} — trang ${k + 1}` : f.name, t, 'pdf' + i));
+      } else push(f.name, await ocr(toCanvas(await fileToImage(f)), label, onProgress), 'img');
     }
-    return docs;
+    return docs.map((d) => ({ name: d.to ? `${d.name} → ${d.to.replace(/^.* — /, '')}` : d.name, text: d.text }));
   }
 
   // ---------- Dò thông tin trong văn bản ----------
@@ -186,15 +196,16 @@ const Scan = (() => {
     if (s !== s.toUpperCase()) return s;
     return s.toLowerCase().replace(/(^|\s)(\S)/g, (m, a, b) => a + b.toUpperCase());
   }
-  const LABELS = /\b(ho\s*(va\s*)?ten|ten goi khac|gioi tinh|sinh ngay|ngay sinh|ngay,? thang,? nam sinh|sinh nam|nam sinh|noi sinh|que quan|quoc tich|dan toc|ton giao|nghe nghiep|trinh do|noi (dang ky )?thuong tru|noi cu tru|noi dkhktt|hktt|ho khau thuong tru|cho o|noi o|so cccd|cccd|cmnd|can cuoc|chung minh|so dinh danh|tien an|tien su|con ong|con ba|ho ten cha|ho ten me|vo|chong|bi bat|hien dang)\b/;
+  const LABELS = /\b(ho\s*(va\s*)?ten|ten goi khac|gioi tinh|noi tam tru|noi o hien tai|noi lam viec|trinh do hoc van|cap ngay|noi cap|the cccd|the cc|nam sinh|tuoi|dia chi|sinh ngay|ngay sinh|ngay,? thang,? nam sinh|sinh nam|nam sinh|noi sinh|que quan|quoc tich|dan toc|ton giao|nghe nghiep|trinh do|noi (dang ky )?thuong tru|noi cu tru|noi dkhktt|hktt|ho khau thuong tru|cho o|noi o|so cccd|cccd|cmnd|can cuoc|chung minh|so dinh danh|tien an|tien su|con ong|con ba|ho ten cha|ho ten me|vo|chong|bi bat|hien dang)\b/;
 
   // Tìm "nhãn: giá trị". short=true thì cắt thêm ở dấu phẩy / chấm.
   function field(f, src, labels, short, raw) {
-    const re = new RegExp(`(?:${labels})\\s*[:：]\\s*([^\\n;]*)`, 'd');
+    // [ \t]* (không phải \s*): ô để trống thì không được lấy nhầm dòng bên dưới.
+    const re = new RegExp(`(?:${labels})[ \\t]*[:：][ \\t]*([^\\n;]*)`, 'd');
     const m = re.exec(f); if (!m) return '';
     let [a, b] = m.indices[1];
     if (raw) return clean(src.slice(a, b));
-    const cut = LABELS.exec(f.slice(a, b)); if (cut && cut.index > 0) b = a + cut.index;
+    const cut = LABELS.exec(f.slice(a, b)); if (cut) b = a + cut.index;
     // Câu văn tiếp theo bị nối vào cùng dòng thì cắt bỏ.
     const stop = /\s(cac bi can|bi can|bi cao|bi khoi to|ve toi|da co hanh vi|hanh vi)\b/.exec(f.slice(a, b)); if (stop && stop.index > 0) b = a + stop.index;
     let v = src.slice(a, b);
@@ -218,7 +229,7 @@ const Scan = (() => {
     p.ngheNghiep = field(f, src, 'nghe nghiep', true);
     p.hktt = field(f, src, 'noi (?:dang ky )?thuong tru|noi dang ky ho khau thuong tru|ho khau thuong tru|noi dkhktt|hktt|noi cu tru');
     p.choO = field(f, src, 'cho o(?: hien nay| hien tai)?|noi o(?: hien nay| hien tai)?');
-    p.tienAn = field(f, src, 'tien an,?\\s*tien su', false, true);
+    p.tienAn = field(f, src, 'tien an\\s*[,\\/\\-–]?\\s*tien su', false, true);
     return p;
   }
 
@@ -260,6 +271,8 @@ const Scan = (() => {
   function crimeFields(f, src) {
     const o = {};
     const t = /ve toi(?!\s*pham\b)\s*[:：]?\s*["“”']?\s*([^\n]{3,160}?)\s*["“”']?\s*[,.]?\s*(?:quy dinh tai|theo quy dinh|theo (?:diem|khoan|dieu)|pham vao|xay ra)/d.exec(f)
+      || /dau hieu toi pham\s*[:：]\s*["“”']?\s*([^\n]{3,160}?)\s*["“”']?\s*[,.]?\s*(?:quy dinh tai|theo quy dinh)/d.exec(f)
+      || /da co hanh vi\s*(?:pham toi\s*)?["“”']?\s*([^\n]{3,160}?)\s*["“”']?\s*(?:[.;]|,?\s*quy dinh tai|pham vao)/d.exec(f)
       || /hanh vi pham toi\s*[:：]?\s*["“”']?\s*([^\n]{3,160}?)\s*["“”']?\s*[,.]?\s*(?:quy dinh tai|theo quy dinh|theo (?:diem|khoan|dieu))/d.exec(f)
       || /toi danh\s*[:：]\s*([^\n;]{3,160})/d.exec(f)
       || /ve toi(?!\s*pham\b)\s*[:：]?\s*["“”']?\s*([^\n;.,]{3,120})/d.exec(f);
@@ -271,38 +284,69 @@ const Scan = (() => {
     return o;
   }
 
+  // Loại văn bản, nhận theo tiêu đề viết HOA. Thứ tự quan trọng: tên dài hơn đứng trước
+  // ("phê chuẩn quyết định khởi tố bị can" trước "quyết định khởi tố bị can").
   const TYPES = [
+    ['pclenh', /phe chuan lenh (?:bat bi can de )?tam giam|phe chuan lenh bat/], ['pcktbc', /phe chuan quyet dinh khoi to bi can/],
+    ['bbbat', /bien ban bat bi can de tam giam|bien ban bat nguoi/], ['pcdtv', /quyet dinh phan cong dieu tra vien/],
+    ['lylich', /ly lich ca nhan|ly lich bi can/],
     ['kldtbs', /ban ket luan dieu tra bo sung|ket luan dieu tra bo sung/], ['kldt', /ban ket luan dieu tra/],
     ['tdc', /quyet dinh tam dinh chi/], ['dc', /quyet dinh dinh chi/],
     ['giahan', /quyet dinh gia han tam giam/], ['ktbc', /quyet dinh khoi to bi can/], ['ktva', /quyet dinh khoi to vu an/],
     ['tamgiam', /lenh tam giam|lenh bat bi can de tam giam/], ['tamgiu', /quyet dinh tam giu/], ['camdi', /lenh cam di khoi noi cu tru/],
   ];
+  // Văn bản mà số, ngày của các quyết định được IN (không viết tay): văn bản của Viện kiểm sát, biên bản, công văn.
+  const PRINTED = ['pclenh', 'pcktbc', 'bbbat', ''];
+  const RANKS = '(?:dai uy|thuong uy|trung uy|thieu uy|thieu ta|trung ta|thuong ta|dai ta)';
+  // Số văn bản hợp lệ: B123, 27/QĐ-CSMT, B12345/LB-CSMT… (loại ký tự rác do đọc chữ viết tay).
+  const validSo = (v) => /^[A-Za-zĐ]{0,2}\d{1,6}(\/[\p{L}\d\-.]+)?$/u.test(v);
   const WORDNUM = { mot: 1, hai: 2, ba: 3, bon: 4, nam: 5, sau: 6, bay: 7, tam: 8, chin: 9, muoi: 10 };
 
   function commonFields(f, src) {
     const o = {};
     let type = ''; let pos = Infinity;
-    for (const [k, re] of TYPES) { const m = re.exec(f); if (m && m.index < pos) { pos = m.index; type = k; } }
+    for (const [k, re] of TYPES) {
+      for (const m of f.matchAll(new RegExp(re.source, 'g'))) {
+        const t = src.slice(m.index, m.index + m[0].length);
+        if (t !== t.toUpperCase()) continue;            // chỉ nhận tiêu đề viết hoa, không nhận câu nhắc tới văn bản khác
+        if (m.index < pos) { pos = m.index; type = k; }
+        break;
+      }
+    }
     // Số và ngày của chính văn bản nằm ở phần đầu (trước tên loại văn bản / trước "Căn cứ"),
-    // không lấy nhầm số của quyết định được viện dẫn bên dưới.
+    // không lấy nhầm số của quyết định được viện dẫn bên dưới, cũng không lấy "Mẫu số", "TT số" ở góc trang.
     const cc = f.search(/\bcan cu\b/);
     const headEnd = Math.min(pos === Infinity ? 700 : pos + 60, cc > 40 ? cc : Infinity, f.length);
     const head = f.slice(0, headEnd);
-    // Dạng "Số: 27/QĐ-CSMT", "Số: ....27..../QĐ-CSMT" (dấu chấm dẫn), hoặc mất chữ "Số" do dấu đè: "27/QĐ-…".
-    const sm = /\bs[o0]\s*[:：;.]?[\s.…]*(\d{1,6})[\s.…]*\/[\s.…]*([^\s,;]+)/d.exec(head)
-      || /(?:^|[\s.…])(\d{1,6})[\s.…]*\/[\s.…]*((?:qd|ltg|lbtg|lcd|kl|kldt|tb|l)[^\s,;]*)/d.exec(head);
-    const s1 = sm ? null : /\bs[o0]\s*[:：]\s*(\S*\d\S*)/d.exec(head);
-    const docSo = sm ? `${sm[1]}/${clean(src.slice(sm.indices[2][0], sm.indices[2][1]))}` : s1 ? clean(src.slice(s1.indices[1][0], s1.indices[1][1])) : '';
+    let docSo = '';
+    for (const m of head.matchAll(/\bs[o0]\s*[:：;.]?[\s.…]*([a-z]{0,2}\d{1,6})[\s.…]*\/[\s.…]*([^\s,;]+)|(?:^|[\s.…])(\d{1,6})[\s.…]*\/[\s.…]*((?:qd|ltg|lbtg|lb|lcd|kl|kldt|tb|l)[^\s,;]*)|\bs[o0]\s*[:：]\s*([a-z]{0,2}\d{1,6})(?=\s|$)/gd)) {
+      if (/(mau|tt|thong tu|theo)\s*$/.test(head.slice(Math.max(0, m.index - 12), m.index).trim() + ' ') || /(mau|tt|thong tu)\s*$/.test(head.slice(Math.max(0, m.index - 10), m.index))) continue;
+      const pick = (i) => (m.indices[i] ? src.slice(m.indices[i][0], m.indices[i][1]) : '');
+      const v = (m[1] ? `${pick(1)}/${clean(pick(2))}` : m[3] ? `${pick(3)}/${clean(pick(4))}` : pick(5)).replace(/\s+/g, '');
+      if (validSo(v) && !/^\d+\/\d{4}\//.test(v)) { docSo = v; break; }
+    }
     const NGAY = new RegExp(`ngay[\\s.…]*(\\d{1,2})[\\s.…]*${THANG}[\\s.…]*(\\d{1,2})[\\s.…]*${NAM}[\\s.…]*(\\d{4})`);
-    const dn = NGAY.exec(head) || NGAY.exec(f);
+    // Ngày của văn bản chỉ lấy ở phần đầu; ngày viết tay không đọc được thì để trống (không lấy nhầm ngày sinh…).
+    const dn = NGAY.exec(head.replace(/ngay\s*\d{1,2}\/\d{1,2}\/\d{4}/g, (x) => ' '.repeat(x.length)));
     const docNgay = dn ? mkDate(dn[1], dn[2], dn[3]) : '';
 
+    // Số, ngày của quyết định được viện dẫn: "Quyết định khởi tố bị can số B1234 ngày 01 tháng 6 năm 2026".
+    // Ưu tiên chỗ "Phê chuẩn … số …" (Điều 1), bỏ chỗ "đề nghị phê chuẩn … số …" (số của công văn đề nghị).
     const ref = (name) => {
-      const m = new RegExp(`${name}\\s*so\\s*[:：]?\\s*(\\d+\\s?\\/\\s?[^\\s,;]+|\\S*\\d\\S*)[\\s\\S]{0,60}?ngay\\s*${DATE}`, 'd').exec(f);
-      return m ? [clean(src.slice(m.indices[1][0], m.indices[1][1])).replace(/\s*\/\s*/g, '/'), mkDate(m[2], m[3], m[4])] : null;
+      let best = null;
+      for (const m of f.matchAll(new RegExp(`${name}\\s*so\\s*[:：]?\\s*([a-z]{0,2}\\d{1,6}(?:\\s?\\/\\s?[^\\s,;]+)?)(?:[\\s\\S]{0,40}?ngay\\s*${DATE})?`, 'gd'))) {
+        const before = f.slice(Math.max(0, m.index - 30), m.index);
+        if (/de nghi\s*phe chuan\s*$/.test(before)) continue;
+        const so = src.slice(m.indices[1][0], m.indices[1][1]).replace(/\s+/g, '');
+        if (!validSo(so)) continue;
+        const cand = { so, ngay: m[2] ? mkDate(m[2], m[3], m[4]) : '', rank: /phe chuan\s*$/.test(before) ? 2 : 1 };
+        if (!best || cand.rank > best.rank || (cand.rank === best.rank && !best.ngay && cand.ngay)) best = cand;
+      }
+      return best;
     };
-    const va = ref('quyet dinh khoi to vu an(?: hinh su)?'); if (va) { o.soQDKTVA = va[0]; o.ngayKTVA = va[1]; }
-    const bc = ref('quyet dinh khoi to bi can'); if (bc) { o.soQDKTBC = bc[0]; o.ngayKTBC = bc[1]; }
+    const va = ref('quyet dinh khoi to vu an(?: hinh su)?'); if (va) { o.soQDKTVA = va.so; if (va.ngay) o.ngayKTVA = va.ngay; }
+    const bc = ref('quyet dinh khoi to bi can'); if (bc) { o.soQDKTBC = bc.so; if (bc.ngay) o.ngayKTBC = bc.ngay; }
+    const lb = ref('lenh (?:bat bi can de )?tam giam'); if (lb) { o.soLenh = lb.so; o.bienPhap = 'tamgiam'; }
 
     // Thời hạn: "từ ngày … đến ngày …", hoặc "N tháng kể từ ngày …".
     let tu = ''; let den = '';
@@ -319,22 +363,29 @@ const Scan = (() => {
     if (type === 'tamgiam' || type === 'tamgiu' || type === 'camdi') {
       o.bienPhap = type; if (docSo) o.soLenh = docSo; if (tu) o.tgTu = tu; if (den) o.tgDen = den;
     }
+    if (type === 'pclenh' || type === 'bbbat') o.bienPhap = 'tamgiam';
     if (type === 'giahan') { o.bienPhap = 'tamgiam'; o.giaHan = [{ so: docSo, loai: '', tu, den }]; }
     if (!type && tu) { o.tgTu = tu; if (den) o.tgDen = den; }
     if (type === 'kldt') { if (docSo) o.soKLDT = docSo; if (docNgay) o.ngayKLDT = docNgay; }
     if (type === 'kldtbs') o.dtbs = [{ so: docSo, ngayKL: docNgay }];
     if (type === 'tdc') { if (docSo) o.soTDC = docSo; if (docNgay) o.ngayTDC = docNgay; }
     if (type === 'dc') { if (docSo) o.soDC = docSo; if (docNgay) o.ngayDC = docNgay; }
+    // "trong thời hạn 04 tháng, kể từ ngày bắt được bị can": chưa có ngày, chỉ biết số tháng.
+    const th = /thoi han\s*(?:tam giam\s*)?[:：]?\s*0?(\d{1,2})\s*thang/.exec(f); if (th) o.thoiHanThang = Number(th[1]);
+    // Biên bản bắt: "Hồi … giờ … ngày … tháng … năm …".
+    if (type === 'bbbat') { const h = new RegExp(`\\bhoi\\b[^\\n]{0,40}?ngay\\s*${DATE}`).exec(f); if (h) o.ngayBat = mkDate(h[1], h[2], h[3]); }
+    if (PRINTED.includes(type)) o.strong = ['soQDKTVA', 'ngayKTVA', 'soQDKTBC', 'ngayKTBC', 'soLenh'].filter((k) => o[k]);
     o.docType = type;
 
-    const ng = /(tr[aạ]i t[aạ]m giam|nh[aà] t[aạ]m gi[uữ]|trai tam giam|nha tam giu|co so giam giu)[^\n,;.]{0,60}/d.exec(f);
+    const ng = /((?:phan )?trai tam giam|nha tam giu|co so giam giu)[^\n,;.]{0,60}/d.exec(f);
     if (ng) {
       const a = ng.indices[0][0]; let b = ng.indices[0][1];
-      const cut = /\s(de|va|theo|ke tu|trong|thuoc|cong an|bo cong an)\s/.exec(f.slice(a, b)); if (cut && cut.index > 12) b = a + cut.index;
+      const cut = /\s(de|va|theo|ke tu|trong|thuoc|cong an|bo cong an|bo tri|neu tren|thi hanh|[–\-—])\s/.exec(f.slice(a, b)); if (cut && cut.index > 12) b = a + cut.index;
       o.noiGiam = clean(src.slice(a, b)).replace(/^./, (c) => c.toUpperCase());
     }
     const nb = new RegExp(`(?:bi bat|bat giu|bat qua tang|bi tam giu|tam giu)[^\\n\\d]{0,25}?ngay\\s*${DATE}`).exec(f);
-    if (nb) o.ngayBat = mkDate(nb[1], nb[2], nb[3]);
+    if (nb && !o.ngayBat) o.ngayBat = mkDate(nb[1], nb[2], nb[3]);
+    if (!o.ngayBat && o.bienPhap === 'tamgiam' && tu) o.ngayBat = tu;   // lệnh bắt để tạm giam: hạn tính từ ngày bắt
     // Tên vụ án: phần đứng sau "(khởi tố) vụ án hình sự …" cho tới hết câu, bỏ đoạn viện dẫn điều luật.
     for (const m of (type === 'ktva' ? f.matchAll(/khoi to vu an(?: hinh su)?[ ]*[:：]?[ ]*(?:ve toi[ ]*[:：]?[ ]*)?(["“”']?[^\n;]{6,240})/gd) : [])) {
       const a = m.indices[1][0]; let b = m.indices[1][1]; const seg = f.slice(a, b);
@@ -363,8 +414,20 @@ const Scan = (() => {
       const t = /\btai\s+((?:phuong|xa|thi tran|dac khu)\s+[^\n,;.]+(?:,\s*(?:thanh pho|tinh|tp|quan|huyen)[^\n,;.]*){0,2})/d.exec(f.slice(pos === Infinity ? 0 : pos));
       if (t) { const off = pos === Infinity ? 0 : pos; o.diaBan = clean(src.slice(off + t.indices[1][0], off + t.indices[1][1])); }
     }
-    o.dtv = titleCase(field(f, src, 'dieu tra vien(?: thu ly)?', true));
-    o.ksv = titleCase(field(f, src, 'kiem sat vien(?: thu ly)?', true));
+    // Mô tả vụ án trong hồ sơ: "vụ án hình sự <hành vi> phát hiện ngày <ngày> tại <địa bàn> do <đối tượng chính> thực hiện".
+    const sig = new RegExp(`vu an(?: hinh su)?[ ]*[:：]?[ ]*["“”']?[ ]*([^\\n"“”']{5,140}?)[ ]*["“”']?\\s*(?:phat hien|xay ra)(?:\\s*vao)?\\s*ngay\\s*${DATE}\\s*tai\\s*([\\s\\S]{5,240}?)\\s+do\\s+([^\\n,.;]{3,60}?)\\s+thuc hien`, 'd').exec(f);
+    if (sig) {
+      const g = (i) => clean(src.slice(sig.indices[i][0], sig.indices[i][1]));
+      o.toiDanhVuAn = fixCrime(g(1)); o.ngayPhatHien = mkDate(sig[2], sig[3], sig[4]); o.diaBan = g(5).replace(/\s*\n\s*/g, ' ');
+      const who = titleCase(g(6)); if (isName(who)) o.doiTuong = who;
+      if (type === 'ktva' || !o.vuAn) o.vuAn = `${o.toiDanhVuAn} phát hiện tại ${o.diaBan}`;
+    }
+    // Điều tra viên: người ghi "(thụ lý chính)", hoặc "Tôi: … – Điều tra viên" trong biên bản.
+    const dv = new RegExp(`(?:\\d\\s*[.)]\\s*)?(?:${RANKS}\\s+)?([^\\n,–\\-]{4,40}?)\\s*[,–\\-]\\s*dieu tra vien\\s*\\(thu ly chinh\\)`, 'd').exec(f)
+      || new RegExp(`\\btoi\\s*[:：]\\s*(?:${RANKS}\\s+)?([^\\n,–\\-]{4,40}?)\\s*[,–\\-]\\s*dieu tra vien`, 'd').exec(f);
+    if (dv) { const n = titleCase(clean(src.slice(dv.indices[1][0], dv.indices[1][1]))); if (isName(n)) o.dtv = n; }
+    if (!o.dtv) { const n = titleCase(field(f, src, 'dieu tra vien(?: thu ly)?', true)); if (isName(n)) o.dtv = n; }
+    const kv = titleCase(field(f, src, 'kiem sat vien(?: thu ly)?', true)); if (isName(kv)) o.ksv = kv;
     return o;
   }
 
@@ -388,7 +451,7 @@ const Scan = (() => {
     for (let i = 1; i < lines.length; i++) {
       const prev = lines[i - 1]; const cur = lines[i];
       const startsLabel = /^(\d+[.)]\s*)?(ho\s*(va\s*)?ten|ten goi khac|gioi tinh|sinh ngay|ngay sinh|quoc tich|dan toc|ton giao|nghe nghiep|trinh do|noi |cho o|so cccd|cccd|cmnd|can cuoc|tien an|dieu \d|can cu|so\s*:)/.test(fold(cur));
-      const join = prev && cur && prev.length >= full * 0.75 && !/[.;:]$/.test(prev) && !startsLabel;
+      const join = prev && cur && prev.length >= full * 0.75 && (!/[.;:]$/.test(prev) || /(^|[\s,])(TP|Tp|TX|TT|P|Q|H|X)\.$/.test(prev)) && !startsLabel;
       out += (join ? ' ' : '\n') + cur;
     }
     return out;
@@ -399,6 +462,7 @@ const Scan = (() => {
     const f = fold(src);
     const common = Object.assign(commonFields(f, src), crimeFields(f, src));
     const type = common.docType || ''; delete common.docType;
+    const strong = common.strong || []; delete common.strong;
     if (!common.toiDanh && common.toiDanhVuAn) common.toiDanh = common.toiDanhVuAn;
     delete common.toiDanhVuAn;
     // Quyết định khởi tố vụ án không ghi rõ tên vụ thì ghép tên từ tội danh và địa bàn.
@@ -423,14 +487,18 @@ const Scan = (() => {
       });
     } else {
       // Không có dòng "Họ tên:": tìm tên sau "đối với (bị can/ông/bà) …", "bị can: …".
-      let hoTen = '';
-      for (const m of f.matchAll(/(?:doi voi|bi can|bi cao)\s*(?:bi can|\(?ong\/ba\)?|ong|ba)?\s*[:：]?\s*([^\n,;:(]{3,60})/gd)) {
-        const a = m.indices[1][0]; let b = m.indices[1][1];
-        const stop = /\s(ve toi|sinh|gioi tinh|la|da|co|bi|thuoc|trong|tai|ve|do|nhu|de)\b/.exec(f.slice(a, b)); if (stop) b = a + stop.index;
-        const cand = nameFrom(f, src, a, b);
-        // tên người viết hoa chữ đầu mỗi từ
-        if (isName(cand) && cand.split(' ').every((w) => w[0] === w[0].toUpperCase() && w[0] !== w[0].toLowerCase())) { hoTen = cand; break; }
-      }
+      const tryName = (re) => {
+        for (const m of f.matchAll(re)) {
+          const a = m.indices[1][0]; let b = m.indices[1][1];
+          const raw = src.slice(a, b); if (raw === raw.toUpperCase()) continue;       // tiêu đề viết hoa
+          const stop = /\s(ve toi|sinh|gioi tinh|la|da|co|bi|thuoc|trong|tai|ve|do|nhu|de|tam giam|tam giu|khoi to)\b/.exec(f.slice(a, b)); if (stop) b = a + stop.index;
+          const cand = nameFrom(f, src, a, b);
+          // tên người viết hoa chữ đầu mỗi từ
+          if (isName(cand) && cand.split(' ').every((w) => w[0] === w[0].toUpperCase() && w[0] !== w[0].toLowerCase())) return cand;
+        }
+        return '';
+      };
+      const hoTen = tryName(/doi voi\s*(?:bi can|\(?ong\/ba\)?|ong|ba)?\s*[:：]?\s*([^\n,;:(]{3,60})/gd) || tryName(/(?:bi can|bi cao)\s*[:：]?\s*([^\n,;:(]{3,60})/gd);
       const p = hoTen ? { hoTen } : {};
       Object.assign(p, personFields(f, src));
       persons.push(p);
@@ -440,7 +508,7 @@ const Scan = (() => {
       for (const [k, v] of Object.entries(Object.assign({}, common, p))) if (v && (!Array.isArray(v) || v.length)) r[k] = v;
       return r;
     }).filter((r) => Object.keys(r).length);
-    return { persons: out, text: src, type, common };
+    return { persons: out, text: src, type, common, strong };
   }
 
   async function dispose() { if (worker) { const w = worker; worker = null; try { await w.terminate(); } catch (e) { /* bỏ qua */ } } }
