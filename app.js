@@ -38,7 +38,7 @@
   ];
   // statDay/statMonth: ngày bắt đầu kỳ thống kê năm (mặc định 15/11: năm 2026 là 15/11/2025 – 14/11/2026).
   const defaultSettings = () => ({ alertDays: 10, statDay: 15, statMonth: 11, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
-  const APP_VERSION = '12'; // tăng cùng lúc với VERSION trong sw.js
+  const APP_VERSION = '13'; // tăng cùng lúc với VERSION trong sw.js
   const PBKDF2_ITER = 310000;
   const AUTO_LOCK_MS = 60 * 1000;
 
@@ -239,7 +239,8 @@
   const caseBySig = (got) => (got && got.doiTuong ? cases.find((c) => sameSig(c, got)) : undefined);
   const casePeople = (c) => records.filter((r) => normName(r.vuAn) === normName(c.ten));
   const first = (list, k) => list.map((r) => r[k]).filter(Boolean).sort()[0] || '';
-  const byKTBC = (a, b) => (a.ngayKTBC || '9999').localeCompare(b.ngayKTBC || '9999') || byName(a, b);
+  // Cùng ngày khởi tố thì người có số quyết định khởi tố bị can nhỏ hơn đứng trước (thường là đối tượng chính).
+  const byKTBC = (a, b) => (a.ngayKTBC || '9999').localeCompare(b.ngayKTBC || '9999') || (Number(soNum(a.soQDKTBC)) || 1e9) - (Number(soNum(b.soQDKTBC)) || 1e9) || byName(a, b);
   // Bị can đầu vụ: người được chọn trong vụ án, nếu chưa chọn thì là bị can bị khởi tố sớm nhất.
   // (hoặc người trùng tên với "đối tượng chính" ghi trong quyết định khởi tố vụ án).
   const leadOf = (c, rs) => rs.find((r) => r.id === c.dauVu) || (c.doiTuong && rs.find((r) => normName(r.hoTen) === normName(c.doiTuong))) || [...rs].sort(byKTBC)[0];
@@ -523,7 +524,7 @@
     case: [['soQDKTVA', 'số QĐ khởi tố vụ án'], ['ngayKTVA', 'ngày khởi tố vụ án'], ['toiDanh', 'tội danh'], ['diaBan', 'địa bàn xảy ra']],
     person: [['ngaySinh', 'ngày sinh'], ['cccd', 'CCCD'], ['hktt', 'nơi thường trú'], ['toiDanh', 'tội danh'], ['soQDKTBC', 'số QĐ khởi tố bị can'], ['ngayKTBC', 'ngày khởi tố bị can'], ['vuAn', 'vụ án']],
   };
-  const missing = (kind, o) => (o ? NEED[kind].filter(([k]) => !o[k]).map(([, t]) => t) : []);
+  const missing = (kind, o) => (o ? [...NEED[kind].filter(([k]) => !o[k]).map(([, t]) => t), ...(kind === 'person' && GIAM_GIU.includes(o.bienPhap) && !o.tgDen ? ['ngày bắt và hạn tạm giam'] : [])] : []);
   function scanNote(what) {
     if (!ui.scan) return '';
     return `<div class="card pad scan-note" style="margin-top:10px"><b>Đã tự điền ${ui.scan.filled.length} mục từ văn bản — hãy kiểm tra lại từng mục trước khi lưu.</b>
@@ -928,7 +929,9 @@
         filled.push(FIELD_NAMES[k]); continue;
       }
       if (r[k] === v) continue;
-      if (!r[k] || ALWAYS_SET.includes(k) || strong.includes(k)) { r[k] = v; filled.push(FIELD_NAMES[k]); }
+      // Tội danh, điều khoản: văn bản sau ghi đầy đủ hơn (thêm tội, thêm điều khoản) thì lấy bản đầy đủ.
+      const fuller = (k === 'toiDanh' || k === 'dieuKhoan') && typeof v === 'string' && v.length > r[k].length && fold(v).includes(fold(r[k]));
+      if (!r[k] || ALWAYS_SET.includes(k) || strong.includes(k) || fuller) { r[k] = v; filled.push(FIELD_NAMES[k]); }
     }
     // Lệnh chỉ ghi "thời hạn N tháng": chọn sẵn loại thời hạn, có ngày bắt đầu thì tính luôn ngày hết hạn.
     if (got.thoiHanThang && !r.loaiHan) {
@@ -1067,6 +1070,7 @@
         const named = res.persons.filter((p) => p.hoTen);
         if (!named.length) { if (!isCaseDoc(res)) log.push({ kind: 'none', file: d.name }); continue; }
         vote('case', res.common, res.strong.filter((k) => k === 'soQDKTVA' || k === 'ngayKTVA'));
+        if (res.common.toiDanhVA) vote('case', { toiDanh: res.common.toiDanhVA }, ['toiDanh']);
         for (const got of named) {
           const ex = findExisting(got);
           if (!ex && !creator) { log.push({ kind: 'skip', file: d.name, name: got.hoTen }); continue; }
@@ -1080,7 +1084,8 @@
           stageFromStop(r, ex); autoStage(r); r.updatedAt = Date.now();
           await putRecord(r);
           touched.add(r.id); vote('p:' + r.id, got, res.strong);
-          if (!names.has(r.id)) names.set(r.id, []); names.get(r.id).push(got.hoTen);
+          if (!names.has(r.id)) names.set(r.id, []);
+          for (let k = 0; k < (['ktbc', 'tamgiam', 'tamgiu', 'bbbat'].includes(res.type) ? 3 : 1); k++) names.get(r.id).push(got.hoTen);   // quyết định, lệnh ghi rõ "Họ tên:" đáng tin hơn
           note('person', r.id, d.name, !ex, filled);
           const e = log.find((x) => x.kind === 'person' && x.id === r.id); if (creator && !e.from) e.from = DOC_NAMES[res.type] || 'văn bản';
         }
@@ -1100,6 +1105,7 @@
     if (batchCases.length === 1 && votes.has('case')) {
       const c = cases.find((x) => x.id === batchCases[0].id); const v = votes.get('case'); const filled = [];
       for (const k of ['soQDKTVA', 'ngayKTVA']) if (v[k]) { const w = winner(v[k], k.startsWith('so')); if (w && c[k] !== w) { c[k] = w; filled.push(CASE_FIELDS[k][1]); } }
+      if (v.toiDanh && !c.toiDanh) { c.toiDanh = winner(v.toiDanh, false); filled.push('Tội danh'); }
       if (filled.length) { c.updatedAt = Date.now(); await putCase(c); note('case', c.id, '', false, filled); }
     }
     for (const id of touched) {
