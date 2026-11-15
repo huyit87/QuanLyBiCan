@@ -460,7 +460,9 @@ const Scan = (() => {
     const th = /thoi han\s*(?:tam giam\s*)?[:：]?\s*0?(\d{1,2})\s*thang/.exec(f); if (th) o.thoiHanThang = Number(th[1]);
     // Biên bản bắt: "Hồi … giờ … ngày … tháng … năm …".
     if (type === 'bbbat') { const h = new RegExp(`\\bhoi\\b[^\\n]{0,40}?ngay\\s*${DATE}`).exec(f); if (h) o.ngayBat = mkDate(h[1], h[2], h[3]); }
-    if (PRINTED.includes(type)) o.strong = ['soQDKTVA', 'ngayKTVA', 'soQDKTBC', 'ngayKTBC', 'soLenh'].filter((k) => o[k]);
+    // Ngày Viện kiểm sát phê chuẩn lệnh bắt / lệnh tạm giam (in ở đầu quyết định phê chuẩn): lệnh chỉ được thi hành từ ngày này.
+    if (type === 'pclenh' && docNgay) o.ngayPCLenh = docNgay;
+    if (PRINTED.includes(type)) o.strong = ['soQDKTVA', 'ngayKTVA', 'soQDKTBC', 'ngayKTBC', 'soLenh', 'ngayPCLenh'].filter((k) => o[k]);
     o.docType = type;
 
     const ng = /((?:phan )?trai tam giam|nha tam giu|co so giam giu)[^\n,;.]{0,60}/d.exec(f);

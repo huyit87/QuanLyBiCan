@@ -38,7 +38,7 @@
   ];
   // statDay/statMonth: ngày bắt đầu kỳ thống kê năm (mặc định 15/11: năm 2026 là 15/11/2025 – 14/11/2026).
   const defaultSettings = () => ({ alertDays: 10, statDay: 15, statMonth: 11, terms: DEFAULT_TERMS.map((t) => ({ ...t })) });
-  const APP_VERSION = '13'; // tăng cùng lúc với VERSION trong sw.js
+  const APP_VERSION = '14'; // tăng cùng lúc với VERSION trong sw.js
   const PBKDF2_ITER = 310000;
   const AUTO_LOCK_MS = 60 * 1000;
 
@@ -150,7 +150,7 @@
   // Bổ sung các trường mới cho hồ sơ tạo từ phiên bản cũ.
   function normalize(r) {
     r.giaHan = r.giaHan || []; r.dtbs = r.dtbs || [];
-    for (const k of ['loaiHan', 'soKLDT', 'ngayKLDT', 'soDC', 'ngayDC', 'soTDC', 'ngayTDC']) r[k] = r[k] || '';
+    for (const k of ['loaiHan', 'ngayPCLenh', 'soKLDT', 'ngayKLDT', 'soDC', 'ngayDC', 'soTDC', 'ngayTDC']) r[k] = r[k] || '';
     return r;
   }
   function normCase(c) { for (const k of ['diaBan', 'dauVu', 'doiTuong', 'ngayPhatHien', 'soKLDT', 'ngayKLDT', 'soDC', 'ngayDC', 'soTDC', 'ngayTDC', 'ghiChu']) c[k] = c[k] || ''; return c; }
@@ -326,8 +326,15 @@
   function deadlineOf(r) {
     if (!GIAM_GIU.includes(r.bienPhap) || r.giaiDoan === 'dinhchi') return null;
     const ds = [r.tgDen, ...(r.giaHan || []).map((g) => g.den)].filter(Boolean).sort();
-    return ds.length ? ds[ds.length - 1] : null;
+    if (ds.length) return ds[ds.length - 1];
+    // Chưa ghi "đến ngày": tính từ ngày bắt đầu + số ngày của loại thời hạn − 1.
+    // Chưa có cả ngày bắt thì tạm tính từ ngày Viện kiểm sát phê chuẩn lệnh (xem hanTamTinh).
+    const days = termDays(r.loaiHan); const base = r.tgTu || r.ngayBat || r.ngayPCLenh;
+    return days && base ? addDays(base, days - 1) : null;
   }
+  // Hạn đang tạm tính từ ngày phê chuẩn lệnh: lệnh chỉ thi hành sau khi được phê chuẩn, nên hạn thật bằng hoặc muộn hơn hạn này.
+  const hanTamTinh = (r) => GIAM_GIU.includes(r.bienPhap) && !r.tgDen && !(r.giaHan || []).some((g) => g.den) && !r.tgTu && !r.ngayBat && !!r.ngayPCLenh && termDays(r.loaiHan) > 0;
+  const chuaCoHan = (r) => GIAM_GIU.includes(r.bienPhap) && r.giaiDoan !== 'dinhchi' && !deadlineOf(r);
   function termDays(ten) {
     const t = (settings.terms || []).find((x) => x.ten === ten);
     return t && t.ngay > 0 ? t.ngay : 0;
@@ -343,8 +350,9 @@
     if (!d) return null;
     const left = diffDays(today(), d);
     const level = left <= 0 ? 'red' : left <= settings.alertDays ? 'orange' : 'green';
-    const text = left < 0 ? `Quá hạn ${-left} ngày` : left === 0 ? 'Hết hạn hôm nay' : `Còn ${left} ngày`;
-    return { date: d, left, level, text };
+    const tam = hanTamTinh(r);
+    const text = (left < 0 ? `Quá hạn ${-left} ngày` : left === 0 ? 'Hết hạn hôm nay' : `Còn ${left} ngày`) + (tam ? ' (tạm tính)' : '');
+    return { date: d, left, level, text, tam };
   }
   const alerts = () => records.map((r) => ({ r, d: dlInfo(r) })).filter((x) => x.d && x.d.level !== 'green').sort((a, b) => a.d.left - b.d.left);
   function bpTag(r) {
@@ -396,6 +404,7 @@
     const bsVks = bs.filter((r) => (r.dtbs[r.dtbs.length - 1] || {}).gd !== 'toa').length;
     const bsLan = {}; bs.forEach((r) => { const l = r.dtbs.length || 1; bsLan[l] = (bsLan[l] || 0) + 1; });
     const al = alerts();
+    const noHan = records.filter(chuaCoHan).sort(byName);
     const upcoming = records.map((r) => ({ r, d: dlInfo(r) })).filter((x) => x.d && x.d.level === 'green').sort((a, b) => a.d.left - b.d.left);
     return `${bar('Quản lý bị can', '', '<button data-act="lock">Khoá</button>')}
     <main class="content">
@@ -409,6 +418,9 @@
       </div>
       ${bs.length ? `<h3 class="section-title">Đang điều tra bổ sung (${bs.length}) — ${Object.entries(bsLan).map(([l, n]) => `lần ${l}: ${n}`).join(', ')}</h3>
       <div class="card">${bs.map((r) => personRow(r, 'dtbs')).join('')}</div>` : ''}
+      ${noHan.length ? `<h3 class="section-title">Đang giam giữ nhưng chưa có hạn (${noHan.length})</h3>
+      <div class="card">${noHan.map((r) => personRow(r)).join('')}</div>
+      <p class="note">Mở hồ sơ, bấm Sửa, nhập "Ngày bắt / tạm giữ" và chọn "Loại thời hạn" để app tính hạn và cảnh báo.</p>` : ''}
       <h3 class="section-title">Hạn tạm giữ, tạm giam cần chú ý (${al.length})</h3>
       <div class="card">${al.length ? al.map((x) => personRow(x.r, true)).join('') : `<div class="empty">Không có hạn nào quá hạn hoặc sắp hết trong ${settings.alertDays} ngày tới.</div>`}</div>
       ${upcoming.length ? `<h3 class="section-title">Các hạn tiếp theo</h3><div class="card">${upcoming.map((x) => personRow(x.r, true)).join('')}</div>` : ''}
@@ -524,7 +536,7 @@
     case: [['soQDKTVA', 'số QĐ khởi tố vụ án'], ['ngayKTVA', 'ngày khởi tố vụ án'], ['toiDanh', 'tội danh'], ['diaBan', 'địa bàn xảy ra']],
     person: [['ngaySinh', 'ngày sinh'], ['cccd', 'CCCD'], ['hktt', 'nơi thường trú'], ['toiDanh', 'tội danh'], ['soQDKTBC', 'số QĐ khởi tố bị can'], ['ngayKTBC', 'ngày khởi tố bị can'], ['vuAn', 'vụ án']],
   };
-  const missing = (kind, o) => (o ? [...NEED[kind].filter(([k]) => !o[k]).map(([, t]) => t), ...(kind === 'person' && GIAM_GIU.includes(o.bienPhap) && !o.tgDen ? ['ngày bắt và hạn tạm giam'] : [])] : []);
+  const missing = (kind, o) => (o ? [...NEED[kind].filter(([k]) => !o[k]).map(([, t]) => t), ...(kind === 'person' && GIAM_GIU.includes(o.bienPhap) && !o.tgDen ? [hanTamTinh(o) ? 'ngày bắt (hạn đang tạm tính từ ngày phê chuẩn lệnh)' : deadlineOf(o) ? null : 'ngày bắt và hạn tạm giam'].filter(Boolean) : [])] : []);
   function scanNote(what) {
     if (!ui.scan) return '';
     return `<div class="card pad scan-note" style="margin-top:10px"><b>Đã tự điền ${ui.scan.filled.length} mục từ văn bản — hãy kiểm tra lại từng mục trước khi lưu.</b>
@@ -741,7 +753,9 @@
     <main class="content nopad-bottom">
       <div class="card hero">${avatar(r, true)}<h2>${esc(r.hoTen)}</h2>
         <div class="tags">${bpTag(r)}<span class="tag">${esc(GIAI_DOAN[r.giaiDoan] || '')}</span></div></div>
-      ${d ? `<div class="deadline ${d.level}" style="margin-top:10px">${esc(d.text)} — hạn ${BIEN_PHAP[r.bienPhap].toLowerCase()} đến ${vn(d.date)}<small>${r.noiGiam ? 'Nơi giam giữ: ' + esc(r.noiGiam) : ''}</small></div>` : ''}
+      ${d ? `<div class="deadline ${d.level}" style="margin-top:10px">${esc(d.text)} — hạn ${BIEN_PHAP[r.bienPhap].toLowerCase()} đến ${vn(d.date)}<small>${r.noiGiam ? 'Nơi giam giữ: ' + esc(r.noiGiam) : ''}</small>
+        ${d.tam ? `<small>Tạm tính ${esc(r.loaiHan)} từ ngày Viện kiểm sát phê chuẩn lệnh (${vn(r.ngayPCLenh)}). Hạn thật tính từ ngày bắt nên bằng hoặc muộn hơn. Bấm Sửa và nhập "Ngày bắt / tạm giữ" để có hạn chính xác.</small>` : ''}</div>`
+      : chuaCoHan(r) ? `<div class="deadline orange" style="margin-top:10px">Chưa có hạn ${BIEN_PHAP[r.bienPhap].toLowerCase()}<small>Bấm Sửa, nhập "Ngày bắt / tạm giữ" và chọn "Loại thời hạn" để app tính hạn và cảnh báo.</small></div>` : ''}
       ${block('Lý lịch', [
         kv('Tên gọi khác', r.tenKhac), kv('Giới tính', r.gioiTinh), kv('Ngày sinh', vn(r.ngaySinh)),
         kv('Số CCCD', r.cccd), kv('Quốc tịch', r.quocTich), kv('Dân tộc', r.danToc), kv('Nghề nghiệp', r.ngheNghiep),
@@ -753,7 +767,7 @@
         kv('QĐ khởi tố bị can', so('', r.soQDKTBC, r.ngayKTBC)), kv('Giai đoạn', GIAI_DOAN[r.giaiDoan]),
       ])}
       ${block('Biện pháp ngăn chặn', [
-        kv('Biện pháp', BIEN_PHAP[r.bienPhap]), kv('Ngày bắt / tạm giữ', vn(r.ngayBat)), kv('Nơi giam giữ', r.noiGiam),
+        kv('Biện pháp', BIEN_PHAP[r.bienPhap]), kv('VKS phê chuẩn lệnh ngày', vn(r.ngayPCLenh)), kv('Ngày bắt / tạm giữ', vn(r.ngayBat)), kv('Nơi giam giữ', r.noiGiam),
         kv('Lệnh / quyết định số', r.soLenh),
         kv('Loại thời hạn', r.loaiHan),
         kv('Thời hạn', r.tgTu || r.tgDen ? `${vn(r.tgTu) || '…'} → ${vn(r.tgDen) || '…'}` : ''),
@@ -775,7 +789,7 @@
   function blank() {
     return { id: uid(), hoTen: '', tenKhac: '', gioiTinh: 'Nam', ngaySinh: '', cccd: '', quocTich: 'Việt Nam', danToc: 'Kinh', ngheNghiep: '', hktt: '', choO: '', tienAn: '', anh: '',
       vuAn: '', soQDKTVA: '', ngayKTVA: '', toiDanh: '', dieuKhoan: '', soQDKTBC: '', ngayKTBC: '', giaiDoan: 'dieutra',
-      bienPhap: 'tamgiam', ngayBat: '', noiGiam: '', soLenh: '', loaiHan: '', tgTu: '', tgDen: '', giaHan: [], soKLDT: '', ngayKLDT: '', dtbs: [], soTDC: '', ngayTDC: '', soDC: '', ngayDC: '', dtv: '', ksv: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
+      bienPhap: 'tamgiam', ngayBat: '', noiGiam: '', soLenh: '', ngayPCLenh: '', loaiHan: '', tgTu: '', tgDen: '', giaHan: [], soKLDT: '', ngayKLDT: '', dtbs: [], soTDC: '', ngayTDC: '', soDC: '', ngayDC: '', dtv: '', ksv: '', ghiChu: '', createdAt: Date.now(), updatedAt: Date.now() };
   }
   function inp(label, name, v, type = 'text', extra = '') {
     return `<label class="field"><span>${esc(label)}</span><input name="${name}" type="${type}" value="${esc(v)}" autocomplete="off" ${extra}></label>`;
@@ -913,7 +927,7 @@
   const FIELD_NAMES = { hoTen: 'Họ tên', tenKhac: 'Tên gọi khác', gioiTinh: 'Giới tính', ngaySinh: 'Ngày sinh', cccd: 'CCCD', quocTich: 'Quốc tịch', danToc: 'Dân tộc',
     ngheNghiep: 'Nghề nghiệp', hktt: 'Nơi thường trú', choO: 'Chỗ ở', tienAn: 'Tiền án, tiền sự', vuAn: 'Vụ án', soQDKTVA: 'Số QĐ khởi tố vụ án', ngayKTVA: 'Ngày khởi tố vụ án',
     toiDanh: 'Tội danh', dieuKhoan: 'Điều khoản', soQDKTBC: 'Số QĐ khởi tố bị can', ngayKTBC: 'Ngày khởi tố bị can', bienPhap: 'Biện pháp ngăn chặn', ngayBat: 'Ngày bắt',
-    noiGiam: 'Nơi giam giữ', soLenh: 'Số lệnh', tgTu: 'Từ ngày', tgDen: 'Đến ngày', giaHan: 'Gia hạn', soKLDT: 'Số kết luận điều tra', ngayKLDT: 'Ngày kết luận điều tra', dtbs: 'Kết luận điều tra bổ sung', soTDC: 'Số QĐ tạm đình chỉ', ngayTDC: 'Ngày tạm đình chỉ', soDC: 'Số QĐ đình chỉ', ngayDC: 'Ngày đình chỉ', dtv: 'Điều tra viên', ksv: 'Kiểm sát viên' };
+    noiGiam: 'Nơi giam giữ', soLenh: 'Số lệnh', ngayPCLenh: 'Ngày VKS phê chuẩn lệnh', tgTu: 'Từ ngày', tgDen: 'Đến ngày', giaHan: 'Gia hạn', soKLDT: 'Số kết luận điều tra', ngayKLDT: 'Ngày kết luận điều tra', dtbs: 'Kết luận điều tra bổ sung', soTDC: 'Số QĐ tạm đình chỉ', ngayTDC: 'Ngày tạm đình chỉ', soDC: 'Số QĐ đình chỉ', ngayDC: 'Ngày đình chỉ', dtv: 'Điều tra viên', ksv: 'Kiểm sát viên' };
   const ALWAYS_SET = ['bienPhap', 'gioiTinh', 'quocTich', 'danToc'];
   // Điền kết quả quét vào hồ sơ: không ghi đè ô người dùng đã nhập. Trả về tên các mục đã điền.
   // strong: các mục lấy từ chỗ in rõ (văn bản của Viện kiểm sát, công văn) — được ghi đè lên giá trị đang có.
@@ -1516,6 +1530,13 @@
         if (t.dataset.k === 'ngay') row.ngay = Math.min(3650, Math.max(1, parseInt(t.value, 10) || 1));
         else row.ten = t.value.trim();
         await metaSet('settings', settings); render(true);
+      } else if (ui.draft && t.name === 'ngayBat') {
+        // Nhập ngày bắt: nếu chưa ghi "từ ngày" thì thời hạn bắt đầu từ ngày bắt, và tính luôn "đến ngày" theo loại thời hạn.
+        syncDraft(); const r = ui.draft; const tu = $('#form [name=tgTu]'); const den = $('#form [name=tgDen]');
+        if (r.ngayBat && tu && !tu.value) {
+          tu.value = r.tgTu = r.ngayBat;
+          const days = termDays(r.loaiHan); if (days && den && !den.value) den.value = r.tgDen = addDays(r.ngayBat, days - 1);
+        }
       } else if (ui.draft && /^(loaiHan|tgTu|gh\d+_(loai|tu))$/.test(t.name || '')) {
         // Tự tính "đến ngày" = từ ngày + số ngày tra theo loại thời hạn − 1
         syncDraft();
